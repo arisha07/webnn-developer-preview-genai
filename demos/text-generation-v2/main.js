@@ -41,6 +41,7 @@ const MODELS = {
         head_size: 128,
         vocab_size: 200064,
         has_position_ids: false,
+        enable_causallm: false,
         system_content: "You are a helpful AI assistant.",
     },
     tinyllama: {
@@ -57,6 +58,7 @@ const MODELS = {
         head_size: 64,
         vocab_size: 32000,
         has_position_ids: false,
+        enable_causallm: false,
         system_content: "",
     },
     qwen2: {
@@ -73,6 +75,7 @@ const MODELS = {
         head_size: 64,
         vocab_size: 151936,
         has_position_ids: false,
+        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     qwen3: {
@@ -90,6 +93,7 @@ const MODELS = {
         vocab_size: 151936,
         has_position_ids: false,
         enable_thinking: false,
+        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     llama32: {
@@ -106,6 +110,7 @@ const MODELS = {
         head_size: 128,
         vocab_size: 128256,
         has_position_ids: false,
+        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     qwen25_nogqa: {
@@ -126,6 +131,7 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
+        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     llama1b_nogqa: {
@@ -144,6 +150,7 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
+        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     deepseekr1: {
@@ -163,6 +170,7 @@ const MODELS = {
         vocab_size: 151936,
         has_position_ids: false,
         enable_thinking: false,
+        enable_causallm: false,
         repetition_penalty: 1.2,
         temperature: 0.6,
         top_k: 50,
@@ -188,6 +196,7 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
+        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     deepseekr1_nogqa: {
@@ -207,6 +216,7 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
+        enable_causallm: false,
         repetition_penalty: 1.0,
         temperature: 0.6,
         top_k: 50,
@@ -644,6 +654,7 @@ async function loadModel(modelKey) {
             profiler: config.profiler,
             verbose: config.verbose,
             local: config.local,
+            enable_causallm: model.enable_causallm || false,
         });
 
         sendButton.disabled = false;

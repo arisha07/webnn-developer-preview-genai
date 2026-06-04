@@ -100,6 +100,7 @@ export class LLM {
                     name: this.provider,
                     deviceType: this.deviceType,
                     context: this.mlContext,
+                    enableCausalLM: !!options.enable_causallm,
                     enableAdditiveDimParam: this.enableAdditiveDimParam,
                     freeDimensionBounds: this.useGqa
                         ? {
