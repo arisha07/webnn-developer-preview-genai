@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test: Stock ORT (no ShapeSubgraphFolder) — Partition Behavior</title>
+    <style>
+        body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 2rem; }
+        #log { white-space: pre-wrap; font-size: 0.85rem; line-height: 1.5; max-height: 80vh; overflow-y: auto; }
+        .error { color: #ff6b6b; }
+        .warn { color: #ffd93d; }
+        .info { color: #6bcf7f; }
+        button { padding: 0.5rem 1rem; margin: 0.5rem; cursor: pointer; }
+    </style>
+</head>
+<body>
+<h2>Test: Stock CDN ORT vs Local Patched ORT (ShapeSubgraphFolder)</h2>
+<p>This page loads stock ONNX Runtime Web from CDN (no ShapeSubgraphFolder patch) and attempts to create a session with the non-GQA Qwen2.5 model. Compare behavior with the patched build.</p>
+<div>
+    <button id="btn-stock">Run with STOCK ORT (CDN)</button>
+    <button id="btn-patched">Run with PATCHED ORT (local dist)</button>
+</div>
+<hr>
+<div id="log"></div>
+
+<script type="module">
+const logEl = document.getElementById("log");
+function log(msg, cls = "") {
+    const line = document.createElement("div");
+    line.className = cls;
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Model config (non-GQA Llama 1B — likely has Where/Equal/Range/ConstantOfShape shape chains)
+const MODEL_PATH = "../text-generation/models/llama-3.2-1B-instruct-nogqa/";
+const MODEL_FILE = "model.onnx";
+const EXTERNAL_DATA = "model.onnx.data";
+const MAX_LENGTH = 2048;
+
+async function fetchModel() {
+    log("Fetching model ONNX file...");
+    const modelResp = await fetch(MODEL_PATH + MODEL_FILE);
+    if (!modelResp.ok) throw new Error(`Failed to fetch model: ${modelResp.status}`);
+    const modelBytes = await modelResp.arrayBuffer();
+    log(`Model loaded: ${(modelBytes.byteLength / 1024 / 1024).toFixed(1)} MB`, "info");
+
+    log("Fetching external data...");
+    const dataResp = await fetch(MODEL_PATH + EXTERNAL_DATA);
+    if (!dataResp.ok) throw new Error(`Failed to fetch external data: ${dataResp.status}`);
+    const dataBytes = await dataResp.arrayBuffer();
+    log(`External data loaded: ${(dataBytes.byteLength / 1024 / 1024).toFixed(1)} MB`, "info");
+
+    return { modelBytes, dataBytes };
+}
+
+async function createSession(modelBytes, dataBytes) {
+    log("Creating WebNN context (GPU)...");
+    const mlContext = await navigator.ml.createContext({ deviceType: "gpu" });
+    log("WebNN context created", "info");
+
+    const sessionOptions = {
+        executionProviders: [{
+            name: "webnn",
+            deviceType: "gpu",
+            context: mlContext,
+        }],
+        externalData: [{
+            data: dataBytes,
+            path: EXTERNAL_DATA,
+        }],
+        extra: {
+            session: { strict_shape_type_inference: "1" },
+        },
+        freeDimensionOverrides: {
+            batch_size: 1,
+            sequence_length: 1,
+            past_sequence_length: MAX_LENGTH - 1,
+            "past_sequence_length + sequence_length": MAX_LENGTH,
+        },
+        logSeverityLevel: 0,
+        logVerbosityLevel: 0,
+    };
+
+    log("Session options: " + JSON.stringify(sessionOptions.freeDimensionOverrides));
+    log("Creating InferenceSession... (watch console for partition/fallback messages)");
+
+    const t0 = performance.now();
+    try {
+        const session = await ort.InferenceSession.create(modelBytes, sessionOptions);
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+        log(`Session created in ${elapsed}s`, "info");
+        log(`Input names: ${session.inputNames.join(", ")}`, "info");
+        log(`Output names: ${session.outputNames.join(", ")}`, "info");
+        return session;
+    } catch (e) {
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+        log(`SESSION CREATION FAILED after ${elapsed}s`, "error");
+        log(`Error: ${e.message}`, "error");
+        throw e;
+    }
+}
+
+async function runTest(ortSource) {
+    logEl.innerHTML = "";
+    log(`=== Testing with ${ortSource} ORT ===`, "info");
+
+    try {
+        // Load ORT
+        if (ortSource === "stock") {
+            log("Loading STOCK ORT from CDN (no ShapeSubgraphFolder)...");
+            // Use latest dev version which has WebNN EP
+            const script = document.createElement("script");
+            script.src = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.all.min.js";
+            script.id = "ort-script";
+            document.head.appendChild(script);
+            await new Promise((resolve, reject) => {
+                script.onload = resolve;
+                script.onerror = () => reject(new Error("CDN load failed"));
+            });
+            log(`Loaded: ort version = ${ort.env.versions?.web || "unknown"}`, "info");
+        } else {
+            log("Loading PATCHED ORT from assets/dist (with ShapeSubgraphFolder + QDQ fix)...");
+            const script = document.createElement("script");
+            script.src = "../../assets/dist/ort.webgpu.min.js";
+            script.id = "ort-script";
+            document.head.appendChild(script);
+            await new Promise((resolve, reject) => {
+                script.onload = resolve;
+                script.onerror = () => reject(new Error("assets/dist load failed"));
+            });
+            log(`Loaded: assets/dist patched build (ort.webgpu.min.js)`, "info");
+        }
+
+        ort.env.wasm.numThreads = 4;
+        ort.env.wasm.simd = true;
+        ort.env.wasm.proxy = false;
+        ort.env.logLevel = "verbose";
+
+        const { modelBytes, dataBytes } = await fetchModel();
+        const session = await createSession(modelBytes, dataBytes);
+
+        log("");
+        log("=== RESULT: Session created successfully ===", "info");
+        log("Check Chrome DevTools console (F12) for partition messages like:", "warn");
+        log('  "webnn_execution_provider.cc" — number of partitions', "warn");
+        log('  "Node X is not supported" — fallback reasons', "warn");
+
+    } catch (e) {
+        log("");
+        log("=== RESULT: FAILED ===", "error");
+        log(`This confirms that without ShapeSubgraphFolder, the model ` +
+            `cannot be properly partitioned/executed.`, "warn");
+        log("");
+        log("Check Chrome DevTools console for detailed error chain.", "warn");
+    }
+}
+
+document.getElementById("btn-stock").addEventListener("click", () => {
+    // Remove existing ORT script if any
+    const existing = document.getElementById("ort-script");
+    if (existing) { existing.remove(); window.ort = undefined; }
+    runTest("stock");
+});
+
+document.getElementById("btn-patched").addEventListener("click", () => {
+    const existing = document.getElementById("ort-script");
+    if (existing) { existing.remove(); window.ort = undefined; }
+    runTest("patched");
+});
+</script>
+</body>
+</html>

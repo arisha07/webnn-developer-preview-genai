@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>WebNN Developer Preview - Text Generation v2</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <!-- Chrome Origin Trial Token -->
+        <meta
+            http-equiv="origin-trial"
+            content="AhjsLjlLzSuPkRlbqxK0oxJTJbR6LAid3bBLDr693iu4jHMRVwWGmyoPKQSNutP3ASfoRBffXBVm5sDT7xe4SgcAAABseyJvcmlnaW4iOiJodHRwczovL21pY3Jvc29mdC5naXRodWIuaW86NDQzIiwiZmVhdHVyZSI6IldlYk1hY2hpbmVMZWFybmluZ05ldXJhbE5ldHdvcmsiLCJleHBpcnkiOjE3ODM5ODcyMDB9"
+        />
+        <link rel="apple-touch-icon" sizes="180x180" href="../text-generation/static/favicon/apple-touch-icon.png" />
+        <link rel="icon" type="image/png" sizes="32x32" href="../text-generation/static/favicon/favicon-32x32.png" />
+        <link rel="icon" type="image/png" sizes="16x16" href="../text-generation/static/favicon/favicon-16x16.png" />
+        <link rel="stylesheet" href="../../assets/css/style.css" />
+        <link rel="stylesheet" href="../text-generation/static/main.css" />
+        <link rel="stylesheet" href="./style.css" />
+        <script type="module" src="main.js"></script>
+    </head>
+
+    <body>
+        <div class="grid-2-41 v1">
+            <h1 class="title">
+                <div id="back">
+                    <a href="../../">
+                        <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24">
+                            <path d="m313-440 224 224-57 56-320-320 320-320 57 56-224 224h487v80H313Z" />
+                        </svg>
+                    </a>
+                </div>
+                <span id="title">WebNN</span> <span id="model">Text Generation</span>
+            </h1>
+            <div id="badge" class="">
+                <div class="badge-text">
+                    <span>Powered by</span>
+                    <div id="device">GPU</div>
+                </div>
+                <div class="tiles">
+                    <div class="tile t0"></div>
+                    <div class="tile t1"></div>
+                    <div class="tile t2"></div>
+                    <div class="tile t1"></div>
+                    <div class="tile t2"></div>
+                    <div class="tile t3"></div>
+                    <div class="tile t2"></div>
+                    <div class="tile t3"></div>
+                    <div class="tile t4"></div>
+                </div>
+            </div>
+        </div>
+        <div class="v9 grid-14">
+            <div id="sidebar">
+                <div id="log" class="log-output"></div>
+                <div class="p-fetch-compile">
+                    <div class="p-bar">
+                        <div id="p-bar-inner" class="p-bar-inner"></div>
+                    </div>
+                    <div class="p-bar-label" id="p-bar-label">0%</div>
+                </div>
+
+                <!-- Model Selector -->
+                <div class="model-selector-panel">
+                    <label for="model-selector">Model</label>
+                    <select id="model-selector"></select>
+
+                    <label for="device-selector">Device</label>
+                    <div class="device-toggle">
+                        <button id="device-gpu" class="device-btn active" data-device="gpu">GPU</button>
+                        <button id="device-npu" class="device-btn" data-device="npu">NPU</button>
+                    </div>
+
+                    <button id="load-model" class="button load-button">Load Model</button>
+                </div>
+
+                <!-- Model Info -->
+                <div id="model-info" class="model-info" hidden>
+                    <h3>Model Info</h3>
+                    <table>
+                        <tr><td>Type</td><td id="info-type"></td></tr>
+                        <tr><td>Layers</td><td id="info-layers"></td></tr>
+                        <tr><td>KV Heads</td><td id="info-kv-heads"></td></tr>
+                        <tr><td>Head Size</td><td id="info-head-size"></td></tr>
+                        <tr><td>Vocab Size</td><td id="info-vocab-size"></td></tr>
+                        <tr><td>Max Length</td><td id="info-max-length"></td></tr>
+                        <tr><td>Dtype</td><td id="info-dtype"></td></tr>
+                    </table>
+                </div>
+
+                <div class="footerinfo">
+                    <div id="info" class="info">
+                        <div id="webnnstatus"></div>
+                        <div id="chromiumversion"></div>
+                        <div id="ortversion"></div>
+                    </div>
+                </div>
+            </div>
+            <div id="input-area">
+                <div id="scroll-wrapper">
+                    <div id="chat-history"></div>
+                </div>
+                <div id="performance-indicator"></div>
+                <div class="button-group key" id="buttons">
+                    <div
+                        class="form-control"
+                        contenteditable="true"
+                        id="user-input"
+                        data-text="✨ How can I help you today?"
+                    ></div>
+                    <button id="send-button" class="button" title="Start" disabled>
+                        <svg viewBox="0 -960 960 960">
+                            <path d="M440-160v-487L216-423l-56-57 320-320 320 320-56 57-224-224v487h-80Z" />
+                        </svg>
+                    </button>
+                    <button id="stop-button" class="button" title="Stop">
+                        <svg viewBox="0 -960 960 960">
+                            <path
+                                d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm0-80h560v-560H200v560Zm0 0v-560 560Z"
+                            />
+                        </svg>
+                    </button>
+                </div>
+                <div class="key-notes">
+                    <div class="enter"><span class="key">enter</span> continue the conversation</div>
+                    <div class="center">·</div>
+                    <div class="ctrl-enter">
+                        <span class="key">ctrl</span><span class="key">enter</span>clears the chat history and start a
+                        new conversation
+                    </div>
+                </div>
+            </div>
+        </div>
+    </body>
+</html>
