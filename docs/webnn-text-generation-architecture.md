@@ -25,7 +25,15 @@ flowchart TB
 
     subgraph L3["LAYER 3 — ORT Web (WASM binary)"]
         L3A["ort-wasm-simd-threaded.asyncify.wasm"]
-        L3B["WebNN Execution Provider — translates ONNX graph → WebNN API calls"]
+        subgraph L3ORT["ORT Core Optimizers (run first)"]
+            L3B["free_dim_override_transformer.cc — replaces symbolic dims with concrete values"]
+            L3C["constant_folding.cc — folds shape subgraphs once dims are concrete"]
+        end
+        subgraph L3EP["WebNN Execution Provider (runs after optimizers)"]
+            L3D["session-options.ts — freeDimensionBounds / freeDimensionOverrides / enableCausalLM"]
+            L3E["model_builder.cc — translates ONNX graph node-by-node → WebNN API calls"]
+            L3F["gqa_op_builder.cc — decomposes GroupQueryAttention → WebNN primitives (ScatterND or concat)"]
+        end
     end
 
     subgraph L2["LAYER 2 — Chromium GPU Process (WebNN Service)"]
@@ -42,7 +50,7 @@ flowchart TB
     end
 
     L4A -->|"WASM call"| L3
-    L3 -->|"Mojo IPC (crosses process boundary)"| L2
+    L3EP -->|"Mojo IPC (crosses process boundary)"| L2
     L2 -->|"Native library call"| L1
 
     %% styling with enforced black text
@@ -53,31 +61,31 @@ flowchart TB
     classDef default stroke:#000,fill:#fff,color:#000;
 
     class L4,L4A layer4
-    class L3,L3A,L3B layer3
+    class L3,L3A,L3ORT,L3B,L3C,L3EP,L3D,L3E,L3F layer3
     class L2,L2A,L2B,L2C,L2D,L2E layer2
     class L1,L1A,L1B layer1
 ```
 
-Each layer only talks to the one directly below it. The browser tab never touches the GPU directly — everything goes through this chain.
+Each layer only talks to the one directly below it. The browser tab never touches the GPU/NPU directly and everything goes through this chain.
 
 ---
 
-## 2. Model Types
+## 2. KV Cache Strategies
 
-Two types of ONNX models are supported, differing significantly in structure.
+There is one ONNX model. The same file can be run in two modes, selected at session creation time via the `enableCausalLM` session option. The model graph does not change; what changes is how ORT's `gqa_op_builder.cc` manages the KV cache internally.
 
-### GQA Models (ORT-GenAI builder export)
+### Stateless Mode (`enableCausalLM: false`, default)
 
-These use a single fused `GroupQueryAttention` op that encapsulates all of: rotary embeddings, KV cache update, head broadcasting, causal masking, and scaled dot-product attention.
+The KV cache is fully visible to JavaScript as session inputs and outputs each step. ORT uses `ScatterND` inside the `GroupQueryAttention` op to write the new token's K and V into a pre-allocated fixed-size buffer at the correct sequence offset. The buffer shape never grows.
 
 ```
-Inputs:
+Inputs per step:
   input_ids                     int64   [1, sequence_length]
   attention_mask                int64   [1, total_sequence_length]
   past_key_values.{L}.key       float16 [1, kv_heads, past_seq_len, head_size]
   past_key_values.{L}.value     float16 [1, kv_heads, past_seq_len, head_size]
 
-Outputs:
+Outputs per step:
   logits                        float16 [1, 1, vocab_size]
   present.{L}.key               float16 [1, kv_heads, past_seq_len, head_size]
   present.{L}.value             float16 [1, kv_heads, past_seq_len, head_size]
@@ -86,11 +94,11 @@ Core ops per layer: SimplifiedLayerNormalization → MatMulNBits → GroupQueryA
 Total nodes: ~300
 ```
 
-Note: `present` shape equals `past` shape — the GQA op writes new tokens in-place using `ScatterND` at the correct offset. The buffer size never changes.
+`present` shape equals `past` shape because the ScatterND write is in-place at the current position offset, not a concatenation.
 
-### Stateful GQA Models (`enableCausalLM: true`)
+### Stateful Mode (`enableCausalLM: true`)
 
-Same model structure but a different KV update strategy selected at session creation. Instead of ScatterND (stateless), the GQA op uses a `concat`-based approach where the framework manages KV state growth internally. KV dims are `[1, kv_heads, 1, head_size]` at session creation — tiny seed tensors — and the model grows them internally. Also passed as an OpenVINO EP hint for NPU optimization.
+ORT manages the KV state internally. JavaScript passes tiny seed tensors of shape `[1, kv_heads, 1, head_size]` at session creation and ORT grows them by concatenating each new token's K and V internally. The cache never leaves ORT memory between steps. ORT receives this as an EP option string and switches `gqa_op_builder.cc` from ScatterND to the concat-based update path.
 
 ---
 
@@ -116,73 +124,11 @@ python builder.py \
     hf_remote=false
 ```
 
-### Flag Reference
 
-| Flag | Value | Meaning |
-|------|-------|---------|
-| `-m` | `Qwen/Qwen2-0.5B-Instruct` | HuggingFace model ID to export |
-| `-o` | `webnn-qwen2-0.5B` | Output directory for the generated model files |
-| `-c` | `honry-cache-dir` | Local cache directory for HuggingFace weights (avoids re-downloading) |
-| `-p` | `int4` | Quantization precision — INT4 weights reduce model size ~4× vs FP16 |
-| `-e` | `webgpu` | Target execution provider — `webgpu` produces the fused GQA-capable export |
+### Why `-e webgpu` Produces GQA Models
 
-### `--extra_options` Explained
+In `builder.py`, the `is_gqa_supported()` method checks whether the requested EP and data type combination is in a known-good list. The `webgpu` EP with `float16` or `float` data type passes this check, so the builder sets `op_type = "GroupQueryAttention"` for all attention layers. This is what produces the fused op — the `-e webgpu` flag plus a compatible precision.
 
-| Option | Value | Meaning |
-|--------|-------|---------|
-| `shared_embeddings` | `true` | Shares input embedding weights with the output projection (lm_head), reducing model size when they are tied in the original architecture |
-| `int4_algo_config` | `rtn_last` | INT4 quantization algorithm — Round-to-Nearest applied to the last (output) dimension of weight matrices; good balance of speed and accuracy |
-| `int4_is_symmetric` | `true` | Symmetric INT4 quantization (zero point = 0); simpler dequantization, slightly lower accuracy than asymmetric but faster |
-| `enable_webgpu_graph` | `true` | Enables the fused `GroupQueryAttention` op and other WebGPU/WebNN-optimized graph patterns; without this the model exports as standard decomposed attention |
-| `prune_lm_head` | `true` | Removes unused output rows from the language model head (vocabulary entries that are never the top-k prediction), reducing logits tensor size |
-| `hf_remote` | `false` | Use local cache only — no network calls to HuggingFace during export (required on networks with proxy restrictions) |
-
-### What the Builder Produces
-
-```
-webnn-qwen2-0.5B/
-├── model.onnx              ← ONNX graph with GroupQueryAttention fused ops
-├── model.onnx.data         ← External weight data (large binary, referenced by model.onnx)
-├── genai_config.json       ← Model metadata: layer count, KV head count, head size, vocab size,
-│                              search params (temperature, top_k, top_p), EOS token IDs
-├── tokenizer.json          ← HuggingFace tokenizer (BPE vocab + merge rules)
-├── tokenizer_config.json   ← Chat template, special token IDs
-└── special_tokens_map.json ← EOS, BOS, PAD token mappings
-```
-
-### Why `webgpu` EP Produces GQA Models
-
-The `-e webgpu` flag instructs the builder to apply WebGPU/WebNN-specific graph optimizations, the most important of which is fusing the multi-head attention + KV cache manipulation into a single `GroupQueryAttention` op. This fusion:
-
-- Reduces graph nodes from ~5000+ (raw HuggingFace Optimum export) to ~300
-- Eliminates `Where`, `Equal`, `Range`, `ConstantOfShape` shape-computation subgraphs
-- Replaces dynamic KV concat with static-size ScatterND update (fixed buffer, write at offset)
-- Enables a single WebNN partition — the entire model runs on GPU with no CPU fallback nodes
-
-Without `enable_webgpu_graph=true`, the export uses decomposed attention (~5000 nodes) which is harder to compile as a single WebNN partition.
-
-### Key Model Config Values (from `genai_config.json`)
-
-The values in `genai_config.json` directly map to the `MODELS` config object in `main.js`:
-
-```json
-{
-    "model": {
-        "decoder": {
-            "head_size": 64,           → model.head_size
-            "num_hidden_layers": 24,   → model.num_layers
-            "num_key_value_heads": 2,  → model.kv_num_heads
-        },
-        "vocab_size": 151936,          → model.vocab_size
-        "eos_token_id": [151645, 151643]  → model.eos_token_id
-    },
-    "search": {
-        "temperature": 0.7,            → model.temperature
-        "top_k": 20,                   → model.top_k
-        "top_p": 0.8                   → model.top_p
-    }
-}
-```
 
 ---
 
@@ -193,7 +139,7 @@ This happens once when the model loads and controls the entire shape of the comp
 ### Code Path (`llm.js load()`)
 
 ```
-main.js: user clicks "Load Model"
+main.js: user clicks a model selector button
     ↓
 llm.js: load(model, options)
     1. navigator.ml.createContext({ deviceType: "gpu" })  → mlContext
@@ -231,7 +177,7 @@ freeDimensionOverrides: {
 }
 ```
 
-This makes dimensions fully static at compile time. Static dims enable constant folding — any subgraph that computes shapes becomes trivially foldable because all inputs are concrete numbers.
+This makes dimensions fully static at compile time. Static dims enable constant folding. Any subgraph that computes shapes becomes trivially foldable because all inputs are concrete numbers.
 
 **`enableCausalLM`** — selects KV update strategy inside `gqa_op_builder.cc`:
 
@@ -254,8 +200,9 @@ When `true`: concat-based stateful KV. When `false` (default): ScatterND statele
 ORT's WebNN EP processes the ONNX graph node by node via `model_builder.cc`, translating each op into WebNN API calls.
 
 **Shape resolution during graph build:**
-1. ORT's standard constant folding runs first. With `freeDimensionOverrides` making all dims concrete, shape subgraphs (`Where`, `Equal`, `Range`, `ConstantOfShape` chains) evaluate to constants and disappear.
-2. For GQA models with `freeDimensionBounds`, dims are dynamic but bounded — ORT's graph builder tracks symbolic dim names.
+1. `FreeDimensionOverrideTransformer` runs at TransformerLevel::Default (`free_dim_override_transformer.cc`) — replaces every symbolic `dim_param` on graph inputs with the concrete `dim_value` from the overrides map, then calls `SetGraphResolveNeeded()`.
+2. `ConstantFolding` runs at TransformerLevel::Level1 (`constant_folding.cc`) — now that input shapes are concrete, any shape-computing subgraph whose inputs are all known constants folds away.
+3. For GQA models using `freeDimensionBounds`, dims remain symbolic through this pass. The WebNN EP merges the bounds into `model_builder.cc` and passes them as `minSize`/`maxSize` to `MLGraphBuilder.input()`.
 
 ### GroupQueryAttention Decomposition (`gqa_op_builder.cc`)
 
