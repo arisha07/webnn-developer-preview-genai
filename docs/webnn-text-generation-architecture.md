@@ -45,10 +45,12 @@ flowchart TB
     L3 -->|"Mojo IPC (crosses process boundary)"| L2
     L2 -->|"Native library call"| L1
 
-    classDef layer4 stroke:#818cf8,fill:#eef2ff
-    classDef layer3 stroke:#a78bfa,fill:#f5f3ff
-    classDef layer2 stroke:#2dd4bf,fill:#f0fdfa
-    classDef layer1 stroke:#fb923c,fill:#fff7ed
+    %% styling with enforced black text
+    classDef layer4 stroke:#818cf8,fill:#eef2ff,color:#000;
+    classDef layer3 stroke:#a78bfa,fill:#f5f3ff,color:#000;
+    classDef layer2 stroke:#2dd4bf,fill:#f0fdfa,color:#000;
+    classDef layer1 stroke:#fb923c,fill:#fff7ed,color:#000;
+    classDef default stroke:#000,fill:#fff,color:#000;
 
     class L4,L4A layer4
     class L3,L3A,L3B layer3
