@@ -1,11 +1,9 @@
 # WebNN Text-Generation Architecture & Execution Flow
 
-**Based on unmodified source:**
+**Based on source:**
 - Demo: `Honry/webnn-developer-preview` @ `support_qwen3`
 - ORT WebNN EP: `Honry/onnxruntime` @ `dynamic-dim-poc`
 - Chromium WebNN Service: `miaobin/chromium` @ `webnn-fully-dynamic-rebase`
-
-**Last updated:** June 5, 2026
 
 ---
 
@@ -17,22 +15,26 @@ Running an LLM in the browser via WebNN involves four distinct layers, each with
 ---
 config:
   layout: elk
+  elk:
+    nodePlacementStrategy: SIMPLE
 ---
 flowchart TB
     subgraph L4["LAYER 4 — Browser Tab (JavaScript)"]
         L4A["main.js → llm.js → navigator.ml (WebNN JS API)"]
     end
 
-    subgraph L3["LAYER 3 — ORT Web (WASM binary)"]
-        L3A["ort-wasm-simd-threaded.asyncify.wasm"]
-        subgraph L3ORT["ORT Core Optimizers (run first)"]
-            L3B["free_dim_override_transformer.cc — replaces symbolic dims with concrete values"]
-            L3C["constant_folding.cc — folds shape subgraphs once dims are concrete"]
-        end
-        subgraph L3EP["WebNN Execution Provider (runs after optimizers)"]
-            L3D["session-options.ts — freeDimensionBounds / freeDimensionOverrides / enableCausalLM"]
-            L3E["model_builder.cc — translates ONNX graph node-by-node → WebNN API calls"]
-            L3F["gqa_op_builder.cc — decomposes GroupQueryAttention → WebNN primitives (ScatterND or concat)"]
+    subgraph L3["LAYER 3 — ORT Web"]
+        L3JS["session-options.ts — JS bundle (ort.all.min.js)
+processes freeDimensionBounds / freeDimensionOverrides / enableCausalLM"]
+        subgraph L3WASM["ort-wasm-simd-threaded.asyncify.wasm — Emscripten-compiled C++"]
+            subgraph L3ORT["ORT Core Optimizers — run first on ONNX graph"]
+                L3B["free_dim_override_transformer.cc — replaces symbolic dims with concrete values"]
+                L3C["constant_folding.cc — folds shape subgraphs once dims are concrete"]
+            end
+            subgraph L3EP["WebNN Execution Provider — runs after optimizers"]
+                L3E["model_builder.cc — translates ONNX graph node-by-node → WebNN API calls"]
+                L3F["gqa_op_builder.cc — decomposes GroupQueryAttention → WebNN primitives (ScatterND or concat)"]
+            end
         end
     end
 
@@ -49,11 +51,12 @@ flowchart TB
         L1B["Compiles ONNX subgraph → OpenVINO IR → runs on Intel GPU/NPU"]
     end
 
-    L4A -->|"WASM call"| L3
-    L3EP -->|"Mojo IPC (crosses process boundary)"| L2
-    L2 -->|"Native library call"| L1
+    L4A    -->|"JS call into ORT"| L3JS
+    L3JS   -->|"WASM call with resolved options"| L3B
+    L3C    -->|"optimized graph passed to EP"| L3E
+    L3F    -->|"Mojo IPC — crosses process boundary"| L2A
+    L2E    -->|"Native library call"| L1A
 
-    %% styling with enforced black text
     classDef layer4 stroke:#818cf8,fill:#eef2ff,color:#000;
     classDef layer3 stroke:#a78bfa,fill:#f5f3ff,color:#000;
     classDef layer2 stroke:#2dd4bf,fill:#f0fdfa,color:#000;
@@ -61,7 +64,7 @@ flowchart TB
     classDef default stroke:#000,fill:#fff,color:#000;
 
     class L4,L4A layer4
-    class L3,L3A,L3ORT,L3B,L3C,L3EP,L3D,L3E,L3F layer3
+    class L3,L3JS,L3B,L3C,L3E,L3F layer3
     class L2,L2A,L2B,L2C,L2D,L2E layer2
     class L1,L1A,L1B layer1
 ```
@@ -132,7 +135,7 @@ In `builder.py`, the `is_gqa_supported()` method checks whether the requested EP
 
 ---
 
-## 4. Session Creation — The Dimension Strategy
+## 4. Session Creation: The Dimension Strategy
 
 This happens once when the model loads and controls the entire shape of the computation graph.
 
@@ -148,9 +151,21 @@ llm.js: load(model, options)
     4. ORT compiles ONNX → WebNN graph (happens once, takes 2–10s)
 ```
 
-### Session Options — Two Dimension Mechanisms
+### WebNN EP Selection
 
-**`freeDimensionBounds`** — tells ORT "this dimension can vary, but here is the maximum":
+The WebNN EP is hardcoded : `provider = "webnn"` is set at module level in `llm.js`. There is no runtime selection. Passing `executionProviders: [{ name: "webnn", deviceType, context }]` into `ort.InferenceSession.create()` is what tells ORT to route the entire graph through the WebNN EP inside the WASM binary.
+
+```js
+executionProviders: [{
+    name: "webnn",          // routes through WebNN EP in WASM
+    deviceType: "gpu",      // forwarded to navigator.ml.createContext()
+    context: this.mlContext // pre-created MLContext, passed directly to ORT
+}]
+```
+
+### Session Options: Two Dimension Mechanisms
+
+**`freeDimensionBounds`** : tells ORT "this dimension can vary, but here is the maximum":
 
 ```js
 freeDimensionBounds: {
@@ -161,7 +176,7 @@ freeDimensionBounds: {
 
 Used for GQA. The WebNN graph is compiled with dynamic shapes but bounded. At dispatch time, any shape ≤ max is valid.
 
-**`freeDimensionOverrides`** — tells ORT "this dimension is exactly this value, always":
+**`freeDimensionOverrides`** : tells ORT "this dimension is exactly this value, always":
 
 ```js
 // Stateless GQA:
@@ -179,7 +194,7 @@ freeDimensionOverrides: {
 
 This makes dimensions fully static at compile time. Static dims enable constant folding. Any subgraph that computes shapes becomes trivially foldable because all inputs are concrete numbers.
 
-**`enableCausalLM`** — selects KV update strategy inside `gqa_op_builder.cc`:
+**`enableCausalLM`** : selects KV update strategy inside `gqa_op_builder.cc`:
 
 ```js
 // session-options.ts (ORT Web):
@@ -193,7 +208,7 @@ When `true`: concat-based stateful KV. When `false` (default): ScatterND statele
 
 ---
 
-## 5. ORT WebNN EP — Translating ONNX to WebNN Ops
+## 5. ORT WebNN EP : Translating ONNX to WebNN Ops
 
 ### What Happens Inside `ort.InferenceSession.create()`
 
@@ -262,17 +277,13 @@ Step 6 — Scaled Dot-Product Attention:
 | Comparison / Logic | `lesser`, `where`, `logicalAnd` |
 | Attention | `scaledDotProductAttention` (or `matmul` + `softmax` fallback) |
 
-### QDQ Fix (`qdq_op_builder.cc`)
-
-For quantized models, `DequantizeLinear` with per-axis scale (1D scale, 2D+ input) requires the scale to be reshaped to be broadcastable. The fix removes the `axis != last` guard and reshapes scale/zero_point for all axes. This is why `ort.webgpu.min.js` must be used — the `ort.all.min.js` JS bundle has its own DQLinear validation that rejects this before it reaches WASM.
-
 ---
 
-## 6. Chromium WebNN Service — Graph Build & Dispatch
+## 6. Chromium WebNN Service : Graph Build & Dispatch
 
 ### Graph Build (`webnn_graph_builder_impl.cc`)
 
-When ORT Web calls the WebNN API to build the graph, it crosses the Mojo IPC boundary into the Chromium GPU process. Every op and operand is validated, then the compiled graph is handed to the native ORT DLL + OpenVINO EP.
+When ORT Web calls the WebNN API to build the graph, it crosses the Mojo IPC boundary into the Chromium GPU process. Every op and operand is validated via `OperationValidationContext`, then the graph info (operands, operations, constants) is passed to `context_->BuildGraph()` which hands it to the backend provider abstraction. The actual hardware backend (e.g. OpenVINO EP) is resolved at that layer, not directly by the builder.
 
 Key validations:
 - Every operand shape is checked (static dims must match exactly, dynamic dims checked against bounds)
@@ -311,7 +322,7 @@ Each `session.run()` call from JS dispatches the compiled graph. Before running,
 
 ---
 
-## 7. Memory Allocation — MLTensors
+## 7. Memory Allocation: MLTensors
 
 JavaScript pre-allocates GPU memory buffers (MLTensors) before inference begins, eliminating allocation overhead during the generate loop.
 
@@ -351,18 +362,18 @@ For each of numLayers layers:
 fetches["logits"] = MLTensor [1, 1, vocab_size]   (readable=true)
 ```
 
-For stateful (`enableCausalLM=true`): no present KV tensors pre-allocated — model manages state internally.
+For stateful (`enableCausalLM=true`): only past KV tensors are pre-allocated in `feed`. No present KV tensors are created — ORT manages the growing KV state internally via concat, so there are no `present` outputs to capture each step.
 
 ---
 
-## 8. Prefill — Processing the Prompt
+## 8. Prefill: Processing the Prompt
 
 `generate()` is called with the tokenized prompt as `inputIds`.
 
 ```
-input_ids      = [t₁, t₂, ..., tₙ]   shape: [1, N]
-attention_mask = [1, 1, ..., 1]       shape: [1, N]      (all ones)
-past_kv.*.key  = pre-allocated zeros  shape: [1, H, maxLen, D]
+input_ids      = [t₁, t₂, ..., tₙ]       shape: [1, N]
+attention_mask = [1, 1, ..., 1]         shape: [1, N]      (all ones)
+past_kv.*.key  = pre-allocated zeros    shape: [1, H, maxLen, D]
                            ↓
               session1.run(feed, fetches)       ← one GPU dispatch
                            ↓
@@ -371,10 +382,10 @@ present.*.key  = float16 [1, H, maxLen, D]     ← KV cache with positions 0..N-
 ```
 
 After the dispatch:
-1. **Read logits to CPU**: `mlContext.readTensor(logits_mlTensor, logitsBuffer)` — only ~vocab_size × 2 bytes cross GPU→CPU
+1. **Read logits to CPU**: `mlContext.readTensor(logits_mlTensor, logitsBuffer)` - only ~vocab_size × 2 bytes cross GPU→CPU
 2. **Apply repetition penalty** (if configured)
-3. **Select first output token** — argmax or sampling
-4. **KV cache swap** — `updateKvCache(outputs)`:
+3. **Select first output token** - argmax or sampling
+4. **KV cache swap** - `updateKvCache(outputs)`:
    ```js
    for each "present.*" in outputs:
        temp = feed["past_key_values.*"]
@@ -386,7 +397,7 @@ After the dispatch:
 
 ---
 
-## 9. Decode Loop — Token-by-Token Generation
+## 9. Decode Loop: Token-by-Token Generation
 
 ```
 WHILE lastToken not in eos_token_ids AND startLength < maxLength:
@@ -423,7 +434,7 @@ WHILE lastToken not in eos_token_ids AND startLength < maxLength:
 
 ---
 
-## 10. Attention Mask — Grows Each Step
+## 10. Attention Mask: Grows Each Step
 
 ```
 Prefill (N=24 tokens):   [1, 1, 1, ..., 1]               shape: [1, 24]
@@ -432,7 +443,7 @@ Decode step 2:           [1, 1, 1, ..., 1, 1, 1]          shape: [1, 26]
 ...
 ```
 
-Inside the GQA op: `seqlens_k = reduceSum(mask) - 1` gives the current sequence position, which determines where `scatterND` writes the new KV entry. This dynamic shape is why `freeDimensionBounds` is needed — the mask grows up to `maxLength` but its exact size changes every step.
+Inside the GQA op: `seqlens_k = reduceSum(mask) - 1` gives the current sequence position, which determines where `scatterND` writes the new KV entry. This dynamic shape is why `freeDimensionBounds` is needed - the mask grows up to `maxLength` but its exact size changes every step.
 
 ---
 
@@ -440,7 +451,7 @@ Inside the GQA op: `seqlens_k = reduceSum(mask) - 1` gives the current sequence 
 
 After each inference step, `selectToken()` picks the next token in JavaScript:
 
-**Greedy (temperature = 0):** `argmax(logitsBuffer, vocabSize)` — picks the highest probability token.
+**Greedy (temperature = 0):** `argmax(logitsBuffer, vocabSize)` - picks the highest probability token.
 
 **Sampling (temperature > 0):** `sampleTopK()`:
 1. Sort all vocab tokens by logit score descending
@@ -471,39 +482,45 @@ Else (new conversation or context overflow):
     inputIds = full prompt including history
 ```
 
-When continuing, the model only processes new tokens but its KV cache retains all previous context — no re-running prefill on the full chat history.
+When continuing, the model only processes new tokens but its KV cache retains all previous context - no re-running prefill on the full chat history.
 
 ---
 
 ## 13. KV Cache Memory Layout
 
+Each KV tensor is allocated once at the full `maxLength` size. Positions fill up as generation progresses — the unused tail is zeros and the GQA op never reads past the current sequence position.
+
 ```
-MLTensor: past_key_values.0.key
-Shape: [1, kv_num_heads, maxLength, head_size]   Type: float16
+Shape: [1, kv_heads, maxLength, head_size]
 
-┌────────┬────────┬────────┬─────┬────────┬────────────────┐
-│ pos 0  │ pos 1  │ pos 2  │ ... │ pos N  │   (unused)     │
-│ ██████ │ ██████ │ ██████ │     │ ██████ │  ░░░░░░░░░░░░  │
-└────────┴────────┴────────┴─────┴────────┴────────────────┘
-◀─── filled by ScatterND ────────▶◀── zeros (never read) ──▶
+After prefill (4 prompt tokens processed):
+  pos:  [  0  ][  1  ][  2  ][  3  ][  4  ][  5  ] ... [maxLen-1]
+        [ K/V ][ K/V ][ K/V ][ K/V ][     ][     ] ... [        ]
+        ◀────── prompt tokens ────▶◀───── zeros, never read ──▶
 
-After ScatterND writes new token at position N+1:
-┌────────┬────────┬────────┬─────┬────────┬──────┬─────────┐
-│ pos 0  │ pos 1  │ pos 2  │ ... │ pos N  │pos N+1│(unused)│
-│ ██████ │ ██████ │ ██████ │     │ ██████ │██████ │░░░░░░░░│
-└────────┴────────┴────────┴─────┴────────┴───────┴────────┘
-```
+Decode step 1  (ScatterND writes at pos 4):
+  pos:  [  0  ][  1  ][  2  ][  3  ][  4  ][  5  ] ... [maxLen-1]
+        [ K/V ][ K/V ][ K/V ][ K/V ][ K/V ][     ] ... [        ]
 
-**Double-buffer zero-copy swap:**
-```
-Step T:   feed[past_kv.0.key] = tensor_A    fetches[present.0.key] = tensor_B
-          GQA reads from A, ScatterND writes to B
-
-Step T+1: feed[past_kv.0.key] = tensor_B    fetches[present.0.key] = tensor_A
-          GQA reads from B, ScatterND writes to A
+Decode step 2  (ScatterND writes at pos 5):
+  pos:  [  0  ][  1  ][  2  ][  3  ][  4  ][  5  ] ... [maxLen-1]
+        [ K/V ][ K/V ][ K/V ][ K/V ][ K/V ][ K/V ] ... [        ]
 ```
 
-No GPU→CPU→GPU data copy. Only logits read back to CPU for token selection.
+**Double-buffer swap (zero GPU data movement)**
+
+Two tensors of identical shape are allocated — `tensor_A` and `tensor_B`. Their roles flip each step via JS reference reassignment. No data moves on the GPU at all.
+
+```
+         tensor_A                          tensor_B
+         ────────────────────────────────────────────────────────
+Step T   INPUT  → GQA reads from it        OUTPUT → ScatterND writes into it
+Step T+1 OUTPUT → ScatterND writes into it INPUT  → GQA reads from it
+Step T+2 INPUT  → GQA reads from it        OUTPUT → ScatterND writes into it
+```
+
+After each step, JS swaps two object references (`feed[past] ↔ fetches[present]`). The GPU buffers never move — only which JS variable points to which tensor changes.
+
 
 ---
 
