@@ -12,56 +12,52 @@
 Running an LLM in the browser via WebNN involves four distinct layers, each with a specific responsibility:
 
 ```mermaid
----
-config:
-  layout: elk
-  elk:
-    nodePlacementStrategy: SIMPLE
----
 flowchart TB
     subgraph L4["LAYER 4 — Browser Tab (JavaScript)"]
         L4A["main.js → llm.js → navigator.ml (WebNN JS API)"]
     end
 
     subgraph L3["LAYER 3 — ORT Web"]
-        L3JS["session-options.ts — JS bundle (ort.all.min.js)
-processes freeDimensionBounds / freeDimensionOverrides / enableCausalLM"]
-        subgraph L3WASM["ort-wasm-simd-threaded.asyncify.wasm — Emscripten-compiled C++"]
-            subgraph L3ORT["ORT Core Optimizers — run first on ONNX graph"]
-                L3B["free_dim_override_transformer.cc — replaces symbolic dims with concrete values"]
-                L3C["constant_folding.cc — folds shape subgraphs once dims are concrete"]
+        L3JS["session-options.ts  |  JS bundle: ort.all.min.js\nfreeDimensionBounds / freeDimensionOverrides / enableCausalLM"]
+        subgraph L3WASM["ort-wasm-simd-threaded.asyncify.wasm  (Emscripten-compiled C++)"]
+            subgraph L3ORT["ORT Core Optimizers — run first"]
+                L3B["free_dim_override_transformer.cc\nreplaces symbolic dims with concrete values"]
+                L3C["constant_folding.cc\nfolds shape subgraphs once dims are concrete"]
             end
             subgraph L3EP["WebNN Execution Provider — runs after optimizers"]
-                L3E["model_builder.cc — translates ONNX graph node-by-node → WebNN API calls"]
-                L3F["gqa_op_builder.cc — decomposes GroupQueryAttention → WebNN primitives (ScatterND or concat)"]
+                L3E["model_builder.cc\ntranslates ONNX graph node-by-node to WebNN API calls"]
+                L3F["gqa_op_builder.cc\ndecomposes GroupQueryAttention to WebNN primitives"]
             end
         end
     end
 
     subgraph L2["LAYER 2 — Chromium GPU Process (WebNN Service)"]
-        L2A["webnn_context_provider_impl.cc — creates MLContext for device type"]
+        L2A["webnn_context_provider_impl.cc — creates MLContext"]
         L2B["webnn_context_impl.cc — owns context, validates dispatch"]
-        L2C["webnn_graph_builder_impl.cc — builds and validates the graph"]
+        L2C["webnn_graph_builder_impl.cc — builds and validates graph"]
         L2D["webnn_graph_impl.cc — dispatches inference"]
-        L2E["shape_folding_interpreter.cc — evaluates shape chains at runtime"]
+        L2E["shape_folding_interpreter.cc — evaluates shape chains"]
     end
 
     subgraph L1["LAYER 1 — ORT Native DLL + OpenVINO EP"]
-        L1A["onnxruntime.dll → onnxruntime_providers_openvino_plugin.dll"]
-        L1B["Compiles ONNX subgraph → OpenVINO IR → runs on Intel GPU/NPU"]
+        L1A["onnxruntime.dll + onnxruntime_providers_openvino_plugin.dll"]
+        L1B["Compiles ONNX subgraph to OpenVINO IR — runs on Intel GPU/NPU"]
     end
 
-    L4A    -->|"JS call into ORT"| L3JS
-    L3JS   -->|"WASM call with resolved options"| L3B
-    L3C    -->|"optimized graph passed to EP"| L3E
-    L3F    -->|"Mojo IPC — crosses process boundary"| L2A
-    L2E    -->|"Native library call"| L1A
+    L4A  -->|"JS call into ORT"| L3JS
+    L3JS -->|"WASM call with resolved options"| L3B
+    L3B  --> L3C
+    L3C  -->|"optimized graph handed to EP"| L3E
+    L3E  --> L3F
+    L3F  -->|"Mojo IPC — crosses process boundary"| L2A
+    L2A  --> L2B --> L2C --> L2D --> L2E
+    L2E  -->|"Native library call"| L1A
+    L1A  --> L1B
 
-    classDef layer4 stroke:#818cf8,fill:#eef2ff,color:#000;
-    classDef layer3 stroke:#a78bfa,fill:#f5f3ff,color:#000;
-    classDef layer2 stroke:#2dd4bf,fill:#f0fdfa,color:#000;
-    classDef layer1 stroke:#fb923c,fill:#fff7ed,color:#000;
-    classDef default stroke:#000,fill:#fff,color:#000;
+    classDef layer4 stroke:#818cf8,fill:#eef2ff,color:#000
+    classDef layer3 stroke:#a78bfa,fill:#f5f3ff,color:#000
+    classDef layer2 stroke:#2dd4bf,fill:#f0fdfa,color:#000
+    classDef layer1 stroke:#fb923c,fill:#fff7ed,color:#000
 
     class L4,L4A layer4
     class L3,L3JS,L3B,L3C,L3E,L3F layer3
