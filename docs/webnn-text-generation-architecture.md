@@ -79,7 +79,7 @@ There is one ONNX model. The same file can be run in two modes, selected at sess
 
 ### Stateless Mode (`enableCausalLM: false`, default)
 
-The KV cache is fully visible to JavaScript as session inputs and outputs each step. ORT uses `ScatterND` inside the `GroupQueryAttention` op to write the new token's K and V into a pre-allocated fixed-size buffer at the correct sequence offset. The buffer shape never grows.
+The KV cache is fully visible to JavaScript as session inputs and outputs each step. `gqa_op_builder.cc` decomposes the `GroupQueryAttention` ONNX op into WebNN primitives, generating a `scatterND` op that writes the new token's K and V into a pre-allocated fixed-size buffer at the correct sequence offset. The buffer shape never grows.
 
 ```
 Inputs per step:
