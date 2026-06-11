@@ -37,11 +37,14 @@ flowchart TB
         L2C["webnn_graph_builder_impl.cc — builds and validates graph"]
         L2D["webnn_graph_impl.cc — dispatches inference"]
         L2E["shape_folding_interpreter.cc — evaluates shape chains"]
+        L2F["graph_builder_ort.cc — rebuilds WebNN ops → ONNX model"]
+        L2G["model_editor.cc — constructs ONNX protobuf"]
+        L2H["ort_session_options.cc — configures native ORT session + OVEP"]
     end
 
-    subgraph L1["LAYER 1 — ORT Native DLL + OpenVINO EP"]
-        L1A["onnxruntime.dll + onnxruntime_providers_openvino_plugin.dll"]
-        L1B["Compiles ONNX subgraph to OpenVINO IR — runs on Intel GPU/NPU"]
+    subgraph L1["LAYER 1 — Native ORT + OpenVINO EP"]
+        L1A["onnxruntime.dll — creates ORT session, runs ORT_ENABLE_BASIC optimizations"]
+        L1B["onnxruntime_providers_openvino_plugin.dll\nCompiles ONNX → OpenVINO IR — executes on Intel GPU/NPU"]
     end
 
     L4A  -->|"JS call into ORT"| L3JS
@@ -51,7 +54,8 @@ flowchart TB
     L3E  --> L3F
     L3F  -->|"Mojo IPC — crosses process boundary"| L2A
     L2A  --> L2B --> L2C --> L2D --> L2E
-    L2E  -->|"Native library call"| L1A
+    L2E  --> L2F --> L2G --> L2H
+    L2H  -->|"Native ORT API call"| L1A
     L1A  --> L1B
 
     classDef layer4 stroke:#818cf8,fill:#eef2ff,color:#000
@@ -61,7 +65,7 @@ flowchart TB
 
     class L4,L4A layer4
     class L3,L3JS,L3B,L3C,L3E,L3F layer3
-    class L2,L2A,L2B,L2C,L2D,L2E layer2
+    class L2,L2A,L2B,L2C,L2D,L2E,L2F,L2G,L2H layer2
     class L1,L1A,L1B layer1
 ```
 
@@ -204,7 +208,63 @@ When `true`: concat-based stateful KV. When `false` (default): ScatterND statele
 
 ---
 
-## 5. ORT WebNN EP : Translating ONNX to WebNN Ops
+## 5. `llm.js` — Step by Step (GQA Flow)
+
+Full sequence from user clicking a model button to tokens streaming on screen.
+
+```mermaid
+flowchart TB
+    A["User clicks model selector button"] --> B
+
+    subgraph LOAD["load()  —  runs once at model selection"]
+        B["Fetch model.onnx + .data from OPFS/network"]
+        B --> C["navigator.ml.createContext()  →  MLContext"]
+        C --> D["ort.InferenceSession.create()\nONNX → WebNN ops  (ORT WASM)\n→ Mojo IPC → WebNN ops → ONNX  (graph_builder_ort.cc)\n→ native ORT + OpenVINO  (2–10s)\nfreeDimensionBounds: sequence_length / total_sequence_length"]
+    end
+
+    D --> E
+
+    subgraph INIT["initialize()  —  runs once after load"]
+        E["Allocate past KV tensors  [1, H, maxLen, D]  float16"]
+        E --> F["Allocate present KV tensors  [1, H, maxLen, D]  float16\n(same shape as past — ScatterND writes in-place)"]
+        F --> G["Allocate logits tensor  [1, 1, vocabSize]  readable=true"]
+    end
+
+    G --> H
+
+    subgraph PREFILL["generate() — prefill  (single dispatch for all prompt tokens)"]
+        H["feed input_ids=[t1..tN]  attention_mask=[1..1,N]  past_kv=zeros"]
+        H --> I["session1.run()  →  one GPU dispatch\nGQA writes K/V for all N tokens via ScatterND"]
+        I --> J["Read logits back to CPU\nswap present → past references\nstartLength += N"]
+    end
+
+    J --> K
+
+    subgraph DECODE["generate() — decode loop  (one dispatch per output token)"]
+        K["feed input_ids=[lastToken]  attention_mask grows by 1"]
+        K --> L["session1.run()  →  GPU dispatch\nGQA ScatterND writes new K/V at position startLength"]
+        L --> M["readBackMLTensor() → logitsBuffer\nselectToken() → argmax or top-k/p sampling"]
+        M --> N["updateKvCache()\nswap JS references: present → past  (zero-copy)"]
+        N --> O["callback(outputTokens)  →  stream text to UI\nstartLength++"]
+        O -->|"not EOS and not maxLength"| K
+    end
+
+    O -->|"EOS or maxLength"| P["Generation complete"]
+
+    classDef loadStyle stroke:#818cf8,fill:#eef2ff,color:#000
+    classDef initStyle stroke:#a78bfa,fill:#f5f3ff,color:#000
+    classDef prefillStyle stroke:#2dd4bf,fill:#f0fdfa,color:#000
+    classDef decodeStyle stroke:#fb923c,fill:#fff7ed,color:#000
+
+    class LOAD,A,B,C,D loadStyle
+    class INIT,E,F,G initStyle
+    class PREFILL,H,I,J prefillStyle
+    class DECODE,K,L,M,N,O,P decodeStyle
+```
+
+---
+
+## 6. ORT WebNN EP : Translating ONNX to WebNN Ops
 
 ### What Happens Inside `ort.InferenceSession.create()`
 
@@ -275,11 +335,11 @@ Step 6 — Scaled Dot-Product Attention:
 
 ---
 
-## 6. Chromium WebNN Service : Graph Build & Dispatch
+## 7. Chromium WebNN Service : Graph Build & Dispatch
 
 ### Graph Build (`webnn_graph_builder_impl.cc`)
 
-When ORT Web calls the WebNN API to build the graph, it crosses the Mojo IPC boundary into the Chromium GPU process. Every op and operand is validated via `OperationValidationContext`, then the graph info (operands, operations, constants) is passed to `context_->BuildGraph()` which hands it to the backend provider abstraction. The actual hardware backend (e.g. OpenVINO EP) is resolved at that layer, not directly by the builder.
+When ORT Web calls the WebNN API to build the graph, it crosses the Mojo IPC boundary into the Chromium GPU process. Every op and operand is validated via `OperationValidationContext`, then the graph info (operands, operations, constants) is passed to `context_->BuildGraph()`. Inside the GPU process, `graph_builder_ort.cc` converts each WebNN op back into ONNX nodes (50+ op types: Conv→`"Conv"`, MatMul→`"MatMul"` etc.) and `model_editor.cc` assembles them into an ONNX protobuf. A native ORT session is then created with OpenVINO EP via `ort_session_options.cc`, and OVEP compiles the ONNX model to GPU kernels.
 
 Key validations:
 - Every operand shape is checked (static dims must match exactly, dynamic dims checked against bounds)
@@ -318,7 +378,7 @@ Each `session.run()` call from JS dispatches the compiled graph. Before running,
 
 ---
 
-## 7. Memory Allocation: MLTensors
+## 8. Memory Allocation: MLTensors
 
 JavaScript pre-allocates GPU memory buffers (MLTensors) before inference begins, eliminating allocation overhead during the generate loop.
 
@@ -362,7 +422,7 @@ For stateful (`enableCausalLM=true`): only past KV tensors are pre-allocated in 
 
 ---
 
-## 8. Prefill: Processing the Prompt
+## 9. Prefill: Processing the Prompt
 
 `generate()` is called with the tokenized prompt as `inputIds`.
 
@@ -393,7 +453,7 @@ After the dispatch:
 
 ---
 
-## 9. Decode Loop: Token-by-Token Generation
+## 10. Decode Loop: Token-by-Token Generation
 
 ```
 WHILE lastToken not in eos_token_ids AND startLength < maxLength:
@@ -430,7 +490,7 @@ WHILE lastToken not in eos_token_ids AND startLength < maxLength:
 
 ---
 
-## 10. Attention Mask: Grows Each Step
+## 11. Attention Mask: Grows Each Step
 
 ```
 Prefill (N=24 tokens):   [1, 1, 1, ..., 1]               shape: [1, 24]
@@ -443,7 +503,7 @@ Inside the GQA op: `seqlens_k = reduceSum(mask) - 1` gives the current sequence 
 
 ---
 
-## 11. Token Selection
+## 12. Token Selection
 
 After each inference step, `selectToken()` picks the next token in JavaScript:
 
@@ -463,7 +523,7 @@ After each inference step, `selectToken()` picks the next token in JavaScript:
 
 ---
 
-## 12. Multi-Turn Chat
+## 13. Multi-Turn Chat
 
 KV cache is reused across turns in the same conversation. In `Query()` (`main.js`):
 
@@ -482,7 +542,7 @@ When continuing, the model only processes new tokens but its KV cache retains al
 
 ---
 
-## 13. KV Cache Memory Layout
+## 14. KV Cache Memory Layout
 
 Each KV tensor is allocated once at the full `maxLength` size. Positions fill up as generation progresses — the unused tail is zeros and the GQA op never reads past the current sequence position.
 
@@ -520,11 +580,11 @@ After each step, JS swaps two object references (`feed[past] ↔ fetches[present
 
 ---
 
-## 14. Performance Profile
+## 15. Performance Profile
 
 | Phase | Typical Time | GPU↔CPU Data | Notes |
 |-------|-------------|--------------|-------|
-| Session create | 2–10s | ~model size (once) | ONNX → OpenVINO IR compilation |
+| Session create | 2–10s | ~model size (once) | ONNX → WebNN ops (ORT WASM) → ONNX rebuild (`graph_builder_ort.cc`) → OpenVINO IR |
 | KV init (`initialize`) | ~50ms | 0 | MLTensor allocation only |
 | Prefill (N tokens) | 140ms–2.3s | ~300KB (logits only) | Single GPU dispatch, all tokens at once |
 | Each decode step | 6–40ms | ~300KB (logits only) | 1 GPU dispatch + JS reference swap |
@@ -546,7 +606,7 @@ After each step, JS swaps two object references (`feed[past] ↔ fetches[present
 
 ---
 
-## 15. File Map
+## 16. File Map
 
 | What | File | Layer |
 |------|------|-------|
@@ -562,3 +622,6 @@ After each step, JS swaps two object references (`feed[past] ↔ fetches[present
 | WebNN graph dispatch | `webnn_graph_impl.cc` | Chromium |
 | Runtime shape evaluation | `public/cpp/shape_folding_interpreter.cc` | Chromium |
 | Dispatch validation | `webnn_context_impl.cc` | Chromium |
+| WebNN ops → ONNX rebuild | `graph_builder_ort.cc` | Chromium GPU process |
+| ONNX protobuf construction | `model_editor.cc` | Chromium GPU process |
+| Native ORT session + EP config | `ort_session_options.cc` | Chromium GPU process |
