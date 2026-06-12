@@ -52,70 +52,30 @@ Key differences from GQA:
 
 ---
 
-## 2. The Three-Layer Stack Required
 
-Non-GQA models require coordinated changes across three layers. Each layer is necessary - removing any one breaks the flow.
-
-```mermaid
-flowchart TB
-    subgraph L3["LAYER 3 — JavaScript (demos/text-generation-v2/)"]
-        L3A["llm.js — Fixed-KV strategy, GPU slice graph, float32 KV"]
-        L3B["main.js — use_gqa:false  kv_dtype:float32  has_position_ids:true"]
-        L3A --> L3B
-    end
-
-    subgraph L2["LAYER 2 — Custom ORT WASM (dist/ort.webgpu.min.js)"]
-        L2A["ort.webgpu.min.js — thin loader, no JS-side QDQ check"]
-        L2B["qdq_op_builder.cc — QDQ per-axis fix inside WASM"]
-        L2C["freeDimensionOverrides pass-through to WebNN EP"]
-        L2A --> L2B --> L2C
-    end
-
-    subgraph L1["LAYER 1 — Custom Chromium (webnn-fully-dynamic-rebase)"]
-        L1A["shape_folding_interpreter.cc — added comparison / logical / where / range ops"]
-        L1B["webnn_context_impl.cc — non-fatal InferAndValidateConcreteShapes"]
-        L1A --> L1B
-    end
-
-    L3B -->|"ort.InferenceSession.create()"| L2A
-    L2C -->|"Mojo IPC"| L1A
-
-    classDef layer3 stroke:#818cf8,fill:#eef2ff,color:#000
-    classDef layer2 stroke:#a78bfa,fill:#f5f3ff,color:#000
-    classDef layer1 stroke:#2dd4bf,fill:#f0fdfa,color:#000
-
-    class L3,L3A,L3B layer3
-    class L2,L2A,L2B,L2C layer2
-    class L1,L1A,L1B layer1
-```
-
----
-
-## 3. Why a Custom ORT Build Is Required
+## 2. Why a Custom ORT Build Is Required
 
 ### Problem: JS-Side QDQ Validation in `ort.all.min.js`
 
-The standard `ort.all.min.js` (781 KB CDN bundle) contains a JavaScript-side `DequantizeLinear` validation that checks:
+The standard `ort.all.min.js` (Content Delivery Network bundle) contains a JavaScript-side `DequantizeLinear` validation that checks:
 
 ```
 assert(rank(scale) == rank(input))
 ```
+It expects scale and input to have the same number of dimensions. But per-axis quantization uses a 1D scale for a 2D+ input - so this JS check fails and throws an error before the model even loads.
 
-For per-axis quantized non-GQA models, `scale` is 1D but `input` is 2D+. This JS check **rejects the op before it reaches WASM**, even though the WASM code correctly reshapes the scale before the WebNN API call.
 
-### Solution: `ort.webgpu.min.js` (66 KB)
+### Solution:
 
-The custom build uses `ort.webgpu.min.js`  a thin loader that delegates **all EP logic to WASM**, bypassing the broken JS validation. Inside WASM (`qdq_op_builder.cc`), the QDQ per-axis fix was applied:
+1. Bypass the JS check - use ort.webgpu.min.js (66KB) instead of ort.all.min.js (781KB). The webgpu bundle is a thin loader that skips the JS-side validation entirely and lets WASM handle everything.
+
+2. Fix WASM too - inside qdq_op_builder.cc, the scale is reshaped to match the input rank before the WebNN call:
 
 ```cpp
-// Removed the axis != last guard — now reshapes scale/zero_point for ALL axes
+// Removed the axis != last guard  now reshapes scale/zero_point for ALL axes
 // scale [N] → reshape → [N, 1, 1] so broadcast works correctly for any input rank
 ```
 
-| Bundle | Size | DQLinear | non-GQA Qwen2.5 | non-GQA Llama 1B |
-|--------|------|----------|-----------------|------------------|
-| `ort.all.min.js` (CDN) | 781 KB | JS-side rank check ❌ | Fails | Fails |
-| `ort.webgpu.min.js` (custom) | 66 KB | WASM handles correctly ✅ | Works | Works |
 
 The demo loads it from `./dist/ort.webgpu.min.js` (local), loaded in `main.js`:
 
@@ -125,7 +85,7 @@ await loadScript("onnxruntime-web", "./dist/ort.webgpu.min.js");
 
 ---
 
-## 4. Session Creation - Static Shape Strategy
+## 3. Session Creation - Static Shape Strategy
 
 ### Why Non-GQA Models Require Static Shapes
 
@@ -185,7 +145,7 @@ This is an OpenVINO EP hint — it does **not** change any JS-side tensor shapes
 
 ---
 
-## 5. `llm.js` — Step by Step
+## 4. `llm.js` — Step by Step
 
 This is the full sequence from the user clicking a model button to tokens streaming on screen.
 
@@ -276,7 +236,7 @@ For GPU non-GQA: dispatches the pre-built WebNN slice graph for each layer - tak
 
 ---
 
-## 6. Model Config in `main.js`
+## 5. Model Config in `main.js`
 
 Non-GQA models require these additional fields compared to GQA configs:
 
@@ -314,7 +274,7 @@ Key non-GQA-specific fields:
 
 ---
 
-## 7. Memory Allocation - Fixed-Size KV with Different Shapes
+## 6. Memory Allocation - Fixed-Size KV with Different Shapes
 
 **Why past and present have different shapes**
 
@@ -363,7 +323,7 @@ MLTensors are raw GPU memory allocations - they do not start as zeros. On the ve
 
 ---
 
-## 8. GPU-Resident KV Cache - WebNN Slice Graph
+## 7. GPU-Resident KV Cache - WebNN Slice Graph
 
 This is the key optimization that makes non-GQA GPU throughput competitive. Without it, 134 MB of KV data must travel GPU→CPU→GPU every token step.
 
@@ -429,7 +389,7 @@ Next step feeds this as past_key_values - window slides forward by 1.
 
 ---
 
-## 9. Prefill - Token-by-Token (Forced by `sequence_length=1`)
+## 8. Prefill - Token-by-Token (Forced by `sequence_length=1`)
 
 Because `freeDimensionOverrides` sets `sequence_length=1`, the compiled graph accepts only `[1, 1]` input_ids. Prefill must process one token at a time:
 
@@ -478,7 +438,7 @@ The shape **never changes** - always `[1, maxLength]`. This is what makes the fu
 
 ---
 
-## 10. Decode Loop
+## 9. Decode Loop
 
 After prefill, the decode loop mirrors GQA but with the fixed-size mask and the GPU slice graph KV update:
 
@@ -512,7 +472,7 @@ while (!eos && startLength < maxLength) {
 
 ---
 
-## 11. What Stays on GPU vs What Crosses to CPU
+## 10. What Stays on GPU vs What Crosses to CPU
 
 ```
 GPU (MLTensor, stays on GPU):
@@ -531,30 +491,8 @@ KV data that moves GPU→CPU per step: **0 bytes**.
 
 ---
 
-## 12. `updateKvCache` - Two Paths
 
-The `updateKvCache` method handles two distinct cases:
-
-```
-                    ┌─────────────────────────────────────────────────────────┐
-                    │                  updateKvCache(outputs)                 │
-                    └──────────────────────┬──────────────────────────────────┘
-                                           │
-                    ┌──────────────────────┴──────────────────────┐
-                    ▼                                             ▼
-            webnn + !useGqa                             GQA or other EP
-            + kvSliceGraph                                        │
-                    │                                   Generic swap:
-            GPU slice dispatch                          feed[past] ↔ fetches[present]
-            (32× per step):
-            dispatch(kvSliceGraph,
-            {present: mlTensor},
-            {past: mlTensor})
-```
-
----
-
-## 13. `logits` Readback - Non-GQA vs GQA
+## 11. `logits` Readback - Non-GQA vs GQA
 
 One important difference: for non-GQA models the logits tensor shape during prefill is technically `[1, sequence_length, vocab_size]`. However because `sequence_length=1` is fixed by `freeDimensionOverrides`, this is always `[1, 1, vocab_size]` - identical to GQA. The same `readBackMLTensor` path is used:
 
@@ -565,7 +503,7 @@ await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.log
 
 ---
 
-## 14. Non-GQA vs GQA - Side-by-Side
+## 12. Non-GQA vs GQA - Side-by-Side
 
 | Aspect | GQA (unmodified `support_qwen3`) | Non-GQA (modified `text-generation-v2`) |
 |--------|----------------------------------|----------------------------------------|
@@ -592,7 +530,7 @@ await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.log
 
 ---
 
-## 15. Performance Profile - Non-GQA
+## 13. Performance Profile - Non-GQA
 
 ### Measured: Llama 3.2 1B (no GQA)
 
@@ -611,7 +549,7 @@ await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.log
 
 ---
 
-## 16. File Map - Changes from Baseline
+## 14. File Map - Changes from Baseline
 
 | File | Change | Why |
 |------|--------|-----|
@@ -632,7 +570,7 @@ await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.log
 
 ---
 
-## 17. How Non-GQA Models Are Generated
+## 15. How Non-GQA Models Are Generated
 
 Non-GQA models are produced by a custom Intel conversion script (`onnx_conversion.py`) rather than the ORT-GenAI `builder.py` used for GQA models. The key difference is that this script exports via **HuggingFace Optimum** (preserving the decomposed attention graph) and then applies **NNCF INT4 weight compression**.
 
