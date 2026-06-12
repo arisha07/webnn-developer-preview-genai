@@ -18,11 +18,11 @@ flowchart TB
     end
 
     subgraph L3["LAYER 3 — ORT Web"]
-        L3JS["session-options.ts  |  JS bundle: ort.all.min.js\nfreeDimensionBounds / freeDimensionOverrides / enableCausalLM"]
+        L3JS["session-options.ts  |  JS bundle: ort.all.min.js\nfreeDimensionOverrides: batch_size=1, past_sequence_length=maxLength\nfreeDimensionBounds: sequence_length / total_sequence_length"]
         subgraph L3WASM["ort-wasm-simd-threaded.asyncify.wasm  (Emscripten-compiled C++)"]
             subgraph L3ORT["ORT Core Optimizers — run first"]
-                L3B["free_dim_override_transformer.cc\nreplaces symbolic dims with concrete values"]
-                L3C["constant_folding.cc\nfolds shape subgraphs once dims are concrete"]
+                L3B["free_dim_override_transformer.cc\npins batch_size=1, past_sequence_length=maxLength\nsequence_length / total_sequence_length remain dynamic"]
+                L3C["constant_folding.cc\nfolds shape subgraphs that depend on now-concrete past_sequence_length"]
             end
             subgraph L3EP["WebNN Execution Provider — runs after optimizers"]
                 L3E["model_builder.cc\ntranslates ONNX graph node-by-node to WebNN API calls"]
