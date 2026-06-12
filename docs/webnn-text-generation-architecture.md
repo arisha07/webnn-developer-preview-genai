@@ -101,7 +101,7 @@ Total nodes: ~300
 
 ### Stateful Mode (`enableCausalLM: true`)
 
-ORT manages the KV state internally. JavaScript passes tiny seed tensors of shape `[1, kv_heads, 1, head_size]` at session creation and ORT grows them by concatenating each new token's K and V internally. The cache never leaves ORT memory between steps. ORT receives this as an EP option string and switches `gqa_op_builder.cc` from ScatterND to the concat-based update path.
+# TODO
 
 ---
 
