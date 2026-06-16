@@ -31,6 +31,9 @@ let gpuDevice;
 let badge;
 let memoryReleaseSwitch;
 const dom = {};
+// Per-model MLContext for hybrid mode IO binding.
+// Maps model name → MLContext. Populated during loadSingleModel().
+const modelContexts = {};
 const modelDOMPrefixes = {
     text_encoder: "textEncoder",
     text_encoder_2: "textEncoder2",
@@ -45,6 +48,9 @@ let loadwave = null;
 let loadwaveData = null;
 let loading;
 let webnnStatus;
+// Round-robin counter for single-image mode: cycles through boxes 0-3
+let nextImageSlot = 0;
+const totalImageSlots = 4;
 
 const config = getConfig();
 const dataType = "float16";
@@ -262,12 +268,19 @@ function getConfig() {
         safetyChecker: true,
         provider: "webnn",
         deviceType: "gpu",
+        // Run text encoders on GPU while running the remaining models on NPU.
+        hybridTextEncoderGpu: false,
+        // Per-model device routing, e.g. "text_encoder:gpu,text_encoder_2:gpu,unet:npu,vae_decoder:npu"
+        deviceMap: "",
         // use QDQ models by default
         // Fix me: set useQdq to true once WebNN OV backend supports MatMulNBits well
-        useQdq: true,
+        MatMulNBitsuseQdq: true,
         useIOBinding: true,
         images: 4,
         verbose: false,
+        forcedSingleImageForNpuUnet: false,
+        // Enable staged loading to manage WASM heap memory during NPU compilation
+        stagedLoading: false,
     };
 
     for (const key in config) {
@@ -288,6 +301,19 @@ function getConfig() {
         // WebGPU EP does not support INT4 QDQ model well yet.
         config.useQdq = false;
     }
+
+    if (config.hybridTextEncoderGpu) {
+        config.provider = "webnn";
+        config.deviceType = "npu";
+    }
+
+    const deviceMap = parseDeviceMap(config.deviceMap);
+    const unetDeviceType = (deviceMap.unet ?? config.deviceType).toLowerCase();
+    if (config.provider === "webnn" && unetDeviceType === "npu" && config.images !== 1) {
+        config.images = 1;
+        config.forcedSingleImageForNpuUnet = true;
+    }
+
     return config;
 }
 
@@ -431,7 +457,129 @@ const getMode = () => {
     return getQueryValue("mode") === "normal" ? false : true;
 };
 
+const isHybridTextEncoderGpuMode = () => {
+    return config.provider === "webnn" && config.hybridTextEncoderGpu;
+};
+
+// Parse "model:device,model:device" string into a {model: device} map
+function parseDeviceMap(str) {
+    if (!str) return {};
+    const map = {};
+    for (const entry of str.split(",")) {
+        const [model, device] = entry.trim().split(":");
+        if (model && device) map[model.trim()] = device.trim().toLowerCase();
+    }
+    return map;
+}
+
+// True when any per-model device routing is active (hybridTextEncoderGpu OR custom deviceMap)
+const isHybridMode = () => {
+    return isHybridTextEncoderGpuMode() || (config.provider === "webnn" && !!config.deviceMap);
+};
+
+const getModelDeviceType = modelName => {
+    if (config.deviceMap) {
+        const deviceMap = parseDeviceMap(config.deviceMap);
+        if (deviceMap[modelName]) return deviceMap[modelName];
+    }
+
+    if (!isHybridTextEncoderGpuMode()) {
+        return config.deviceType;
+    }
+
+    if (modelName === "text_encoder" || modelName === "text_encoder_2") {
+        return "gpu";
+    }
+
+    return "npu";
+};
+
 const sizeOfShape = shape => shape.reduce((a, b) => a * b, 1);
+
+/*
+ * load a single model: fetch from OPFS/network, create InferenceSession
+ */
+async function loadSingleModel(name, model, models) {
+    const modelNameInLog = model.name;
+    let start = performance.now();
+
+    let modelUrl = `${config.model}/onnx/${model.url}`;
+    if (modelUrl.includes("huggingface.co")) {
+        await getHuggingFaceDomain().then(domain => {
+            modelUrl = modelUrl.replace("huggingface.co", domain);
+        });
+    }
+    log(`[Load] Loading model ${modelNameInLog} · ${model.size}`);
+
+    const hasExternalData = model.externalData === true;
+    const opfsKey = `sdxl-turbo_${modelUrl.replace(/\//g, "_")}`;
+    let modelBuffer = await getModelOPFS(opfsKey, modelUrl, false);
+
+    const sessOpt = { ...opt, ...model.opt };
+    // For models with external data (.onnx_data), pass the URL as a string
+    // so ORT WASM fetches it internally (avoids 2GB+ ArrayBuffer allocation failure).
+    if (hasExternalData) {
+        const dataUrl = modelUrl + "_data";
+        log(`[Load] ${modelNameInLog} has external data: ${dataUrl}`);
+        sessOpt.externalData = [
+            {
+                path: model.url + "_data",
+                data: dataUrl,
+            },
+        ];
+    }
+
+    if (isHybridMode()) {
+        const modelDeviceType = getModelDeviceType(name);
+        const perModelContext = await navigator.ml.createContext({ deviceType: modelDeviceType });
+        modelContexts[name] = perModelContext;
+        sessOpt.executionProviders = [
+            {
+                name: "webnn",
+                deviceType: modelDeviceType,
+                context: perModelContext,
+            },
+        ];
+        log(`[Load] ${modelNameInLog} assigned to WebNN ${modelDeviceType.toUpperCase()}`);
+    }
+
+    const modelFetchTime = (performance.now() - start).toFixed(2);
+
+    if (dom[name]) {
+        dom[name].fetch.innerHTML = modelFetchTime;
+    }
+
+    log(`[Load] ${modelNameInLog} loaded · ${modelFetchTime}ms`);
+    log(`[Session Create AK] Beginning ${modelNameInLog}`);
+
+    start = performance.now();
+    try {
+        models[name].sess = await ort.InferenceSession.create(modelBuffer, sessOpt);
+    } catch (sessionError) {
+        log(`[Load] Session creation failed for ${modelNameInLog} (possibly corrupted cache), retrying with fresh download...`);
+        modelBuffer = await getModelOPFS(opfsKey, modelUrl, true);
+        models[name].sess = await ort.InferenceSession.create(modelBuffer, sessOpt);
+    }
+    // Release the raw model buffer to free memory before loading the next model
+    modelBuffer = null;
+    const sessionCreationTime = (performance.now() - start).toFixed(2);
+
+    if (dom[name]) {
+        dom[name].create.innerHTML = sessionCreationTime;
+        progressManager.update(name, "compile", 100);
+    }
+
+    if (getMode()) {
+        log(`[Session Create AK] Create ${modelNameInLog} completed · ${sessionCreationTime}ms`);
+    } else {
+        log(`[Session Create AK] Create ${modelNameInLog} completed`);
+    }
+}
+
+// Returns true when staged loading is needed to avoid exceeding the WASM heap.
+const needsStagedLoading = () => {
+    return config.stagedLoading;
+};
 
 /*
  * load models used in the pipeline
@@ -442,41 +590,31 @@ async function loadModels(models) {
     updateLoadWave(0.0);
     load.disabled = true;
     try {
-        for (const [name, model] of Object.entries(models)) {
-            const modelNameInLog = model.name;
-            let start = performance.now();
-            let modelUrl = `${config.model}/onnx/${model.url}`;
-            if (modelUrl.includes("huggingface.co")) {
-                await getHuggingFaceDomain().then(domain => {
-                    modelUrl = modelUrl.replace("huggingface.co", domain);
-                });
-            }
-            log(`[Load] Loading model ${modelNameInLog} · ${model.size}`);
-            const modelBuffer = await getModelOPFS(`sdxl-turbo_${modelUrl.replace(/\//g, "_")}`, modelUrl, false);
-            const sessOpt = { ...opt, ...model.opt };
-            const modelFetchTime = (performance.now() - start).toFixed(2);
+        if (needsStagedLoading()) {
+            // Staged loading: load UNet first (largest model) while WASM heap is empty,
+            // then load remaining models. This avoids exceeding the WASM memory limit
+            // during UNet compilation.
+            log("[Load] Using staged loading to manage memory for all-NPU mode");
 
-            if (dom[name]) {
-                dom[name].fetch.innerHTML = modelFetchTime;
+            // Stage 1: Load large models (UNet, VAE, safety_checker) first
+            const largeModels = ["unet", "vae_decoder", "safety_checker", "sc_prep", "scheduler"];
+            for (const name of largeModels) {
+                if (models[name]) {
+                    await loadSingleModel(name, models[name], models);
+                }
             }
 
-            log(`[Load] ${modelNameInLog} loaded · ${modelFetchTime}ms`);
-            log(`[Session Create] Beginning ${modelNameInLog}`);
-
-            start = performance.now();
-            console.log(sessOpt);
-            models[name].sess = await ort.InferenceSession.create(modelBuffer, sessOpt);
-            const sessionCreationTime = (performance.now() - start).toFixed(2);
-
-            if (dom[name]) {
-                dom[name].create.innerHTML = sessionCreationTime;
-                progressManager.update(name, "compile", 100);
+            // Stage 2: Load text encoders and small helper models
+            const textModels = ["text_encoder", "text_encoder_2", "concat", "latents"];
+            for (const name of textModels) {
+                if (models[name]) {
+                    await loadSingleModel(name, models[name], models);
+                }
             }
-
-            if (getMode()) {
-                log(`[Session Create] Create ${modelNameInLog} completed · ${sessionCreationTime}ms`);
-            } else {
-                log(`[Session Create] Create ${modelNameInLog} completed`);
+        } else {
+            // Standard loading: compile all models sequentially
+            for (const [name, model] of Object.entries(models)) {
+                await loadSingleModel(name, model, models);
             }
         }
 
@@ -485,13 +623,13 @@ async function loadModels(models) {
         }
         const startInitTensors = performance.now();
         await initializeTensors();
-        log(`[Session Create] Initialize tensors completed · ${(performance.now() - startInitTensors).toFixed(2)}ms`);
+        log(`[Session Create AK] Initialize tensors completed · ${(performance.now() - startInitTensors).toFixed(2)}ms`);
     } catch (e) {
         logError(`[Load] failed, ${e}`);
         return;
     }
     updateLoadWave(100.0);
-    log("[Session Create] Ready to generate images");
+    log("[Session Create AK] Ready to generate images");
     let imageArea = $$("#image_area>div");
     imageArea.forEach(i => {
         i.setAttribute("class", "frame ready");
@@ -518,7 +656,13 @@ const getDataTypeSize = dataType => {
     }
 };
 
-async function createTensor(tensorInfo) {
+// Returns the MLContext for a given model name. In hybrid mode, each model has
+// its own context; otherwise falls back to the global mlContext.
+function getContextForModel(modelName) {
+    return modelContexts[modelName] || mlContext;
+}
+
+async function createTensor(tensorInfo, ctx) {
     let tensor;
     const numElements = sizeOfShape(tensorInfo.dims);
     if (!config.useIOBinding) {
@@ -546,8 +690,9 @@ async function createTensor(tensorInfo) {
         return new ort.Tensor(tensorInfo.dataType, data, tensorInfo.dims);
     }
     if (config.provider === "webnn") {
+        const context = ctx || mlContext;
         tensor = await createMlTensor(
-            mlContext,
+            context,
             tensorInfo.dataType,
             tensorInfo.dims,
             tensorInfo.writable ?? false,
@@ -562,14 +707,15 @@ async function createTensor(tensorInfo) {
     return tensor;
 }
 
-function writeTensor(tensor, data) {
+function writeTensor(tensor, data, ctx) {
     if (!config.useIOBinding) {
         tensor.data.set(data);
         return;
     }
 
     if (config.provider === "webnn") {
-        mlContext.writeTensor(tensor.mlTensorData, data);
+        const context = ctx || mlContext;
+        context.writeTensor(tensor.mlTensorData, data);
     } else if (config.provider === "webgpu") {
         const size = data.byteLength;
         const alignedSize = Math.ceil(size / 4) * 4;
@@ -589,14 +735,15 @@ function writeTensor(tensor, data) {
     }
 }
 
-async function readTensor(tensor, targetBuffer) {
+async function readTensor(tensor, targetBuffer, ctx) {
     if (!config.useIOBinding) {
         targetBuffer.set(tensor.data);
         return;
     }
 
     if (config.provider === "webnn") {
-        await readBackMLTensor(mlContext, tensor.mlTensorData, targetBuffer);
+        const context = ctx || mlContext;
+        await readBackMLTensor(context, tensor.mlTensorData, targetBuffer);
     } else if (config.provider === "webgpu") {
         const bufferSize = sizeOfShape(tensor.dims) * getDataTypeSize(tensor.type);
         await readBackGpuTensor(gpuDevice, tensor.gpuBuffer, bufferSize, targetBuffer);
@@ -623,92 +770,221 @@ function disposeTensors() {
     }
 }
 
+// Bridge data from a tensor on one device context to a tensor on another device context
+// by reading back to CPU and writing to the target. Only needed at cross-device boundaries.
+async function bridgeTensor(srcTensor, dstTensor, srcCtx, dstCtx) {
+    const size = sizeOfShape(srcTensor.dims);
+    let buffer;
+    switch (srcTensor.type) {
+        case "float16":
+            buffer = new Float16Array(size);
+            break;
+        case "float32":
+            buffer = new Float32Array(size);
+            break;
+        case "int32":
+            buffer = new Int32Array(size);
+            break;
+        default:
+            buffer = new Uint8Array(size * getDataTypeSize(srcTensor.type));
+    }
+    await readTensor(srcTensor, buffer, srcCtx);
+    writeTensor(dstTensor, buffer, dstCtx);
+}
+
+// Registry of cross-device tensor edges that need CPU-round-trip bridging at runtime.
+// Populated by wireOrBridge() during initializeTensors(), consumed by bridgeOutputsOf() during generateImage().
+const crossDeviceBridges = [];
+
+// Wire a model output to a downstream model input. If both models share the same
+// MLContext (or IO binding is off), returns the source tensor directly (zero-copy).
+// Otherwise, recreates the source output as readable, creates a separate writable
+// input on the destination context, and registers a bridge for runtime execution.
+async function wireOrBridge(srcModelName, srcKey, srcInfo, dstModelName, dstKey, dstInfo) {
+    const srcCtx = getContextForModel(srcModelName);
+    const dstCtx = getContextForModel(dstModelName);
+
+    if (!isHybridMode() || !config.useIOBinding || srcCtx === dstCtx) {
+        return models[srcModelName].fetches[srcKey];
+    }
+
+    // Cross-device: make source readable, create separate writable dest
+    models[srcModelName].fetches[srcKey] =
+        await createTensor({ ...srcInfo, readable: true }, srcCtx);
+    const dstTensor = await createTensor({ ...dstInfo, writable: true }, dstCtx);
+    crossDeviceBridges.push({ srcModel: srcModelName, srcKey, dstModel: dstModelName, dstKey });
+    return dstTensor;
+}
+
+// Execute all registered bridges where the source model matches the given name.
+// Call this after running a model to copy its outputs to any cross-device consumers.
+async function bridgeOutputsOf(modelName) {
+    for (const { srcModel, srcKey, dstModel, dstKey } of crossDeviceBridges) {
+        if (srcModel === modelName) {
+            await bridgeTensor(
+                models[srcModel].fetches[srcKey],
+                models[dstModel].feed[dstKey],
+                getContextForModel(srcModel),
+                getContextForModel(dstModel),
+            );
+        }
+    }
+}
+
 async function initializeTensors() {
+    // Get per-model contexts (falls back to global mlContext in non-hybrid mode)
+    const teCtx = getContextForModel("text_encoder");
+    const te2Ctx = getContextForModel("text_encoder_2");
+    const concatCtx = getContextForModel("concat");
+    const latentsCtx = getContextForModel("latents");
+    const unetCtx = getContextForModel("unet");
+    const schedulerCtx = getContextForModel("scheduler");
+    const vaeCtx = getContextForModel("vae_decoder");
+
+    // Clear any previous bridges
+    crossDeviceBridges.length = 0;
+
     // text_encoder
     models["text_encoder"].feed = {
-        input_ids: await createTensor(models["text_encoder"].inputInfo.input_ids),
+        input_ids: await createTensor(models["text_encoder"].inputInfo.input_ids, teCtx),
     };
     models["text_encoder"].fetches = {
-        "hidden_states.11": await createTensor(models["text_encoder"].outputInfo["hidden_states.11"]),
+        "hidden_states.11": await createTensor(models["text_encoder"].outputInfo["hidden_states.11"], teCtx),
     };
 
     // text_encoder_2
     models["text_encoder_2"].feed = {
-        input_ids: await createTensor(models["text_encoder_2"].inputInfo.input_ids),
+        input_ids: await createTensor(models["text_encoder_2"].inputInfo.input_ids, te2Ctx),
     };
     models["text_encoder_2"].fetches = {
-        "hidden_states.31": await createTensor(models["text_encoder_2"].outputInfo["hidden_states.31"]),
-        text_embeds: await createTensor(models["text_encoder_2"].outputInfo.text_embeds),
+        "hidden_states.31": await createTensor(models["text_encoder_2"].outputInfo["hidden_states.31"], te2Ctx),
+        text_embeds: await createTensor(models["text_encoder_2"].outputInfo.text_embeds, te2Ctx),
     };
 
-    // concat
+    // concat — inputs from text encoders (may be cross-device)
+    const concatHs1 = await wireOrBridge(
+        "text_encoder", "hidden_states.11", models["text_encoder"].outputInfo["hidden_states.11"],
+        "concat", "hidden_states_1", models["concat"].inputInfo.hidden_states_1,
+    );
+    const concatHs2 = await wireOrBridge(
+        "text_encoder_2", "hidden_states.31", models["text_encoder_2"].outputInfo["hidden_states.31"],
+        "concat", "hidden_states_2", models["concat"].inputInfo.hidden_states_2,
+    );
+    const concatTe = await wireOrBridge(
+        "text_encoder_2", "text_embeds", models["text_encoder_2"].outputInfo.text_embeds,
+        "concat", "text_embeds", models["concat"].inputInfo.text_embeds,
+    );
+
     models["concat"].feed = {
-        hidden_states_1: models["text_encoder"].fetches["hidden_states.11"],
-        hidden_states_2: models["text_encoder_2"].fetches["hidden_states.31"],
-        text_embeds: models["text_encoder_2"].fetches.text_embeds,
-        sample: await createTensor(models["concat"].inputInfo.sample),
+        hidden_states_1: concatHs1,
+        hidden_states_2: concatHs2,
+        text_embeds: concatTe,
+        sample: await createTensor(models["concat"].inputInfo.sample, concatCtx),
     };
     models["concat"].fetches = {
-        prompt_embeds: await createTensor(models["concat"].outputInfo.prompt_embeds),
-        pooled_prompt_embeds: await createTensor(models["concat"].outputInfo.pooled_prompt_embeds),
+        prompt_embeds: await createTensor(models["concat"].outputInfo.prompt_embeds, concatCtx),
+        pooled_prompt_embeds: await createTensor(models["concat"].outputInfo.pooled_prompt_embeds, concatCtx),
     };
 
     // latents
     models["latents"].feed = {
-        sample: await createTensor(models["latents"].inputInfo.sample),
+        sample: await createTensor(models["latents"].inputInfo.sample, latentsCtx),
     };
     models["latents"].fetches = {
-        latents: await createTensor(models["latents"].outputInfo.latents),
-        latentModelInput: await createTensor(models["latents"].outputInfo.latentModelInput),
+        latents: await createTensor(models["latents"].outputInfo.latents, latentsCtx),
+        latentModelInput: await createTensor(models["latents"].outputInfo.latentModelInput, latentsCtx),
     };
 
-    // unet
+    // unet — inputs from concat and latents (may be cross-device)
+    const unetSample = await wireOrBridge(
+        "latents", "latentModelInput", models["latents"].outputInfo.latentModelInput,
+        "unet", "sample", models["unet"].inputInfo.sample,
+    );
+    const unetHidden = await wireOrBridge(
+        "concat", "prompt_embeds", models["concat"].outputInfo.prompt_embeds,
+        "unet", "encoder_hidden_states", models["unet"].inputInfo.encoder_hidden_states,
+    );
+    const unetTextEmbeds = await wireOrBridge(
+        "concat", "pooled_prompt_embeds", models["concat"].outputInfo.pooled_prompt_embeds,
+        "unet", "text_embeds", models["unet"].inputInfo.text_embeds,
+    );
+
     models["unet"].feed = {
-        sample: models["latents"].fetches.latentModelInput,
-        timestep: await createTensor(models["unet"].inputInfo.timestep),
-        encoder_hidden_states: models["concat"].fetches.prompt_embeds,
-        text_embeds: models["concat"].fetches.pooled_prompt_embeds,
-        time_ids: await createTensor(models["unet"].inputInfo.time_ids),
+        sample: unetSample,
+        timestep: await createTensor(models["unet"].inputInfo.timestep, unetCtx),
+        encoder_hidden_states: unetHidden,
+        text_embeds: unetTextEmbeds,
+        time_ids: await createTensor(models["unet"].inputInfo.time_ids, unetCtx),
     };
-    // Initialize the tensors early to avoid re-allocation during execution
-    writeTensor(models["unet"].feed.timestep, new Float16Array([999]));
-    writeTensor(models["unet"].feed.time_ids, getAddTimeIds(imageHeight, imageWidth, batchSize));
+    writeTensor(models["unet"].feed.timestep, new Float16Array([999]), unetCtx);
+    writeTensor(models["unet"].feed.time_ids, getAddTimeIds(imageHeight, imageWidth, batchSize), unetCtx);
     models["unet"].fetches = {
-        out_sample: await createTensor(models["unet"].outputInfo.out_sample),
+        out_sample: await createTensor(models["unet"].outputInfo.out_sample, unetCtx),
     };
 
-    // scheduler
+    // scheduler — inputs from unet and latents (may be cross-device)
+    const schedOutSample = await wireOrBridge(
+        "unet", "out_sample", models["unet"].outputInfo.out_sample,
+        "scheduler", "out_sample", models["scheduler"].inputInfo.out_sample,
+    );
+    const schedSample = await wireOrBridge(
+        "latents", "latents", models["latents"].outputInfo.latents,
+        "scheduler", "sample", models["scheduler"].inputInfo.sample,
+    );
+
     models["scheduler"].feed = {
-        out_sample: models["unet"].fetches.out_sample,
-        sample: models["latents"].fetches.latents,
+        out_sample: schedOutSample,
+        sample: schedSample,
     };
     models["scheduler"].fetches = {
-        prevSample: await createTensor(models["scheduler"].outputInfo.prevSample),
+        prevSample: await createTensor(models["scheduler"].outputInfo.prevSample, schedulerCtx),
     };
 
-    // vae_decoder
+    // vae_decoder — input from scheduler (may be cross-device)
+    const vaeInput = await wireOrBridge(
+        "scheduler", "prevSample", models["scheduler"].outputInfo.prevSample,
+        "vae_decoder", "latent_sample", models["vae_decoder"].inputInfo.latent_sample,
+    );
+
     models["vae_decoder"].feed = {
-        latent_sample: models["scheduler"].fetches.prevSample,
+        latent_sample: vaeInput,
     };
     models["vae_decoder"].fetches = {
-        sample: await createTensor(models["vae_decoder"].outputInfo.sample),
+        sample: await createTensor(models["vae_decoder"].outputInfo.sample, vaeCtx),
     };
 
     // safety_checker
     if (config.safetyChecker) {
+        const scPrepCtx = getContextForModel("sc_prep");
+        const scCtx = getContextForModel("safety_checker");
+
+        const scPrepInput = await wireOrBridge(
+            "vae_decoder", "sample", models["vae_decoder"].outputInfo.sample,
+            "sc_prep", "sample", models["sc_prep"].inputInfo.sample,
+        );
+
         models["sc_prep"].feed = {
-            sample: models["vae_decoder"].fetches.sample,
+            sample: scPrepInput,
         };
         models["sc_prep"].fetches = {
-            clip_input: await createTensor(models["sc_prep"].outputInfo.clip_input),
+            clip_input: await createTensor(models["sc_prep"].outputInfo.clip_input, scPrepCtx),
         };
 
+        const scInput = await wireOrBridge(
+            "sc_prep", "clip_input", models["sc_prep"].outputInfo.clip_input,
+            "safety_checker", "clip_input", models["safety_checker"].inputInfo.clip_input,
+        );
+
         models["safety_checker"].feed = {
-            clip_input: models["sc_prep"].fetches.clip_input,
+            clip_input: scInput,
         };
         models["safety_checker"].fetches = {
-            has_nsfw_concepts: await createTensor(models["safety_checker"].outputInfo.has_nsfw_concepts),
+            has_nsfw_concepts: await createTensor(models["safety_checker"].outputInfo.has_nsfw_concepts, scCtx),
         };
+    }
+
+    if (crossDeviceBridges.length > 0) {
+        log(`[Config] ${crossDeviceBridges.length} cross-device tensor bridge(s) registered.`);
     }
 }
 
@@ -783,7 +1059,15 @@ function drawImage(pix, imageIndex, height, width) {
 async function generateImage() {
     generate.disabled = true;
     const imgDivs = $$("#image_area > div");
-    imgDivs.forEach(div => div.setAttribute("class", "frame"));
+
+    // In single-image mode (batchSize 1), only reset the target slot;
+    // in batch mode, reset all slots.
+    if (batchSize === 1) {
+        const targetDiv = $(`#img_div_${nextImageSlot}`);
+        if (targetDiv) targetDiv.setAttribute("class", "frame");
+    } else {
+        imgDivs.forEach(div => div.setAttribute("class", "frame"));
+    }
 
     try {
         dom["runTotal"].innerHTML = "";
@@ -795,8 +1079,12 @@ async function generateImage() {
         log(`[Session Run] Beginning`);
 
         await loading;
-        for (let i = 0; i < batchSize; i++) {
-            $(`#img_div_${i}`).setAttribute("class", "frame inferncing");
+        if (batchSize === 1) {
+            $(`#img_div_${nextImageSlot}`).setAttribute("class", "frame inferncing");
+        } else {
+            for (let i = 0; i < batchSize; i++) {
+                $(`#img_div_${i}`).setAttribute("class", "frame inferncing");
+            }
         }
 
         // Inference prepare for Text Encoders
@@ -814,7 +1102,7 @@ async function generateImage() {
         });
 
         const inputIdsData = new Int32Array(inputIds);
-        writeTensor(models["text_encoder"].feed.input_ids, inputIdsData);
+        writeTensor(models["text_encoder"].feed.input_ids, inputIdsData, getContextForModel("text_encoder"));
         await runModel(models["text_encoder"]);
 
         const sessionRunTimeTextEncode = (performance.now() - start).toFixed(2);
@@ -834,7 +1122,7 @@ async function generateImage() {
             return_tensor: false,
         });
         const inputIds2Data = new BigInt64Array(inputIds2.map(x => BigInt(x)));
-        writeTensor(models["text_encoder_2"].feed.input_ids, inputIds2Data);
+        writeTensor(models["text_encoder_2"].feed.input_ids, inputIds2Data, getContextForModel("text_encoder_2"));
         await runModel(models["text_encoder_2"]);
 
         const sessionRunTimeTextEncode2 = (performance.now() - start).toFixed(2);
@@ -845,11 +1133,16 @@ async function generateImage() {
             log(`[Session Run] Text Encoder 2 completed`);
         }
 
+        // Bridge cross-device outputs from text encoders
+        await bridgeOutputsOf("text_encoder");
+        await bridgeOutputsOf("text_encoder_2");
+
         // Inference prepare for UNet
 
         // Construct promptEmbeds and pooledPromptEmbeds (Batch N) by repeating the single batch output
         start = performance.now();
         await runModel(models["concat"]);
+        await bridgeOutputsOf("concat");
         if (getMode()) {
             log(`[Session Run] concat execution time: ${(performance.now() - start).toFixed(2)}ms`);
         } else {
@@ -859,6 +1152,7 @@ async function generateImage() {
         // Initialize latents (Batch N) for random noise
         start = performance.now();
         await runModel(models["latents"]);
+        await bridgeOutputsOf("latents");
         if (getMode()) {
             log(`[Session Run] latents execution time: ${(performance.now() - start).toFixed(2)}ms`);
         } else {
@@ -868,6 +1162,7 @@ async function generateImage() {
         // Run UNet
         start = performance.now();
         await runModel(models["unet"]);
+        await bridgeOutputsOf("unet");
         const unetRunTime = (performance.now() - start).toFixed(2);
 
         if (getMode()) {
@@ -881,6 +1176,7 @@ async function generateImage() {
         // scheduler
         start = performance.now();
         await runModel(models["scheduler"]);
+        await bridgeOutputsOf("scheduler");
         if (getMode()) {
             log(`[Session Run] Scheduler execution time: ${(performance.now() - start).toFixed(2)}ms`);
         } else {
@@ -890,10 +1186,11 @@ async function generateImage() {
         // Run VAE Decoder
         start = performance.now();
         await runModel(models["vae_decoder"]);
+        await bridgeOutputsOf("vae_decoder");
 
         const pixSize = sizeOfShape(models["vae_decoder"].outputInfo.sample.dims);
         let pix = new Float16Array(pixSize);
-        await readTensor(models["vae_decoder"].fetches.sample, pix);
+        await readTensor(models["vae_decoder"].fetches.sample, pix, getContextForModel("vae_decoder"));
 
         let vaeRunTime = (performance.now() - start).toFixed(2);
 
@@ -904,11 +1201,16 @@ async function generateImage() {
         }
 
         start = performance.now();
-        for (let i = 0; i < batchSize; i++) {
-            const size = 3 * imageHeight * imageWidth;
-            const offset = i * size;
-            const subPix = pix.subarray(offset, offset + size);
-            drawImage(subPix, i, imageHeight, imageWidth);
+        if (batchSize === 1) {
+            // Single-image mode: draw into the current round-robin slot
+            drawImage(pix, nextImageSlot, imageHeight, imageWidth);
+        } else {
+            for (let i = 0; i < batchSize; i++) {
+                const size = 3 * imageHeight * imageWidth;
+                const offset = i * size;
+                const subPix = pix.subarray(offset, offset + size);
+                drawImage(subPix, i, imageHeight, imageWidth);
+            }
         }
         const imageDrawTime = (performance.now() - start).toFixed(2);
         log(`[Images Drawing] drawing ${batchSize} images time: ${imageDrawTime}ms`);
@@ -923,6 +1225,7 @@ async function generateImage() {
             // 1. Run Preprocessing Model (VAE Output -> SC Input)
             let start = performance.now();
             await runModel(models["sc_prep"]);
+            await bridgeOutputsOf("sc_prep");
 
             if (getMode()) {
                 log(`[Session Run] Safety Checker input prepared time: ${(performance.now() - start).toFixed(2)}ms`);
@@ -936,20 +1239,31 @@ async function generateImage() {
 
             // 3. Read Results
             let nsfwBuffer = new Uint8Array(batchSize);
-            await readTensor(models["safety_checker"].fetches.has_nsfw_concepts, nsfwBuffer);
+            await readTensor(models["safety_checker"].fetches.has_nsfw_concepts, nsfwBuffer, getContextForModel("safety_checker"));
 
             const totalScRunTime = (performance.now() - start).toFixed(2);
 
             // 4. Process Results UI
-            for (let i = 0; i < batchSize; i++) {
-                let nsfw = nsfwBuffer[i] ? true : false;
-                log(`[Session Run][Image ${i + 1}] Safety Checker - not safe for work (NSFW) concepts: ${nsfw}`);
-
+            if (batchSize === 1) {
+                let nsfw = nsfwBuffer[0] ? true : false;
+                log(`[Session Run][Image ${nextImageSlot + 1}] Safety Checker - not safe for work (NSFW) concepts: ${nsfw}`);
                 if (nsfw) {
-                    $(`#img_div_${i}`).setAttribute("class", "frame done nsfw");
-                    $(`#img_div_${i}`).setAttribute("title", "Not safe for work (NSFW) content");
+                    $(`#img_div_${nextImageSlot}`).setAttribute("class", "frame done nsfw");
+                    $(`#img_div_${nextImageSlot}`).setAttribute("title", "Not safe for work (NSFW) content");
                 } else {
-                    $(`#img_div_${i}`).setAttribute("class", "frame done");
+                    $(`#img_div_${nextImageSlot}`).setAttribute("class", "frame done");
+                }
+            } else {
+                for (let i = 0; i < batchSize; i++) {
+                    let nsfw = nsfwBuffer[i] ? true : false;
+                    log(`[Session Run][Image ${i + 1}] Safety Checker - not safe for work (NSFW) concepts: ${nsfw}`);
+
+                    if (nsfw) {
+                        $(`#img_div_${i}`).setAttribute("class", "frame done nsfw");
+                        $(`#img_div_${i}`).setAttribute("title", "Not safe for work (NSFW) content");
+                    } else {
+                        $(`#img_div_${i}`).setAttribute("class", "frame done");
+                    }
                 }
             }
 
@@ -958,9 +1272,18 @@ async function generateImage() {
                 log(`[Session Run] Safety Checker execution time (Batch ${batchSize}): ${totalScRunTime}ms`);
             }
         } else {
-            for (let i = 0; i < batchSize; i++) {
-                $(`#img_div_${i}`).setAttribute("class", "frame done");
+            if (batchSize === 1) {
+                $(`#img_div_${nextImageSlot}`).setAttribute("class", "frame done");
+            } else {
+                for (let i = 0; i < batchSize; i++) {
+                    $(`#img_div_${i}`).setAttribute("class", "frame done");
+                }
             }
+        }
+
+        // Advance round-robin slot for single-image mode
+        if (batchSize === 1) {
+            nextImageSlot = (nextImageSlot + 1) % totalImageSlots;
         }
 
         $("#total_data").innerHTML = `${totalRunTime}ms`;
@@ -1052,9 +1375,7 @@ const updateLoadWave = value => {
 
 const updateDeviceTypeLinks = () => {
     let backendLinks = $("#backend-links");
-    // Fix me: Once NPU is supported, uncomment the following line
-    // const links = `· <a href="./?devicetype=gpu">GPU</a> · <a id="npu_link" href="./?devicetype=npu">NPU</a>`;
-    const links = `· <a href="./?devicetype=gpu">GPU</a>`;
+    const links = `· <a href="./?devicetype=gpu">GPU</a> · <a id="npu_link" href="./?devicetype=npu">NPU</a> · <a href="./?devicetype=npu&deviceMap=text_encoder_2:gpu">Hybrid</a>`;
     backendLinks.innerHTML = `${links}`;
 };
 
@@ -1083,6 +1404,14 @@ const ui = async () => {
         dev.setAttribute("class", "mt-1");
     }
 
+    if (config.forcedSingleImageForNpuUnet) {
+        log("[Config] UNet on NPU supports only batch size 1. Forcing images=1.");
+    }
+
+    if (isHybridMode()) {
+        log("[Config] Hybrid mode enabled with IO binding: cross-device tensors will be bridged via CPU.");
+    }
+
     await setupORT("sdxl-turbo", "dev");
     showCompatibleChromiumVersion("sdxl-turbo");
 
@@ -1092,6 +1421,28 @@ const ui = async () => {
         load.disabled = false;
     } else {
         await checkWebNN();
+    }
+
+    if (isHybridMode()) {
+        try {
+            const deviceTypes = new Set([config.deviceType]);
+            if (config.hybridTextEncoderGpu) {
+                deviceTypes.add("gpu");
+                deviceTypes.add("npu");
+            }
+            if (config.deviceMap) {
+                for (const dt of Object.values(parseDeviceMap(config.deviceMap))) {
+                    deviceTypes.add(dt);
+                }
+            }
+            for (const dt of deviceTypes) {
+                await navigator.ml.createContext({ deviceType: dt });
+            }
+            log(`[Config] Hybrid mode enabled: models routed across ${[...deviceTypes].map(d => d.toUpperCase()).join(", ")}.`);
+        } catch (error) {
+            logError(`[Error] Hybrid mode requires WebNN support for all specified device types: ${error.message}`);
+            throw error;
+        }
     }
 
     for (const [modelName, prefix] of Object.entries(modelDOMPrefixes)) {
@@ -1116,12 +1467,18 @@ const ui = async () => {
                 if (config.useIOBinding) {
                     mlContext = await navigator.ml.createContext({ deviceType: config.deviceType });
                 }
+
+                const executionProvider = {
+                    name: "webnn",
+                    deviceType: config.deviceType,
+                };
+
+                if (mlContext) {
+                    executionProvider.context = mlContext;
+                }
+
                 opt.executionProviders = [
-                    {
-                        name: "webnn",
-                        deviceType: config.deviceType,
-                        context: mlContext,
-                    },
+                    executionProvider,
                 ];
             }
             break;
@@ -1132,7 +1489,11 @@ const ui = async () => {
     const deviceType = config.deviceType.toLowerCase();
     const provider = config.provider.toLowerCase();
 
-    if (deviceType === "cpu") {
+    if (isHybridMode()) {
+        device.innerHTML = "GPU + NPU";
+        badge.setAttribute("class", "hybrid");
+        document.body.setAttribute("class", "hybrid");
+    } else if (deviceType === "cpu") {
         device.innerHTML = "CPU";
         badge.setAttribute("class", "cpu");
         document.body.setAttribute("class", "cpu");
