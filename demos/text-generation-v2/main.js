@@ -41,7 +41,6 @@ const MODELS = {
         head_size: 128,
         vocab_size: 200064,
         has_position_ids: false,
-        enable_causallm: false,
         system_content: "You are a helpful AI assistant.",
     },
     tinyllama: {
@@ -58,7 +57,6 @@ const MODELS = {
         head_size: 64,
         vocab_size: 32000,
         has_position_ids: false,
-        enable_causallm: false,
         system_content: "",
     },
     qwen2: {
@@ -75,7 +73,6 @@ const MODELS = {
         head_size: 64,
         vocab_size: 151936,
         has_position_ids: false,
-        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     qwen3: {
@@ -93,7 +90,6 @@ const MODELS = {
         vocab_size: 151936,
         has_position_ids: false,
         enable_thinking: false,
-        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     llama32: {
@@ -110,16 +106,15 @@ const MODELS = {
         head_size: 128,
         vocab_size: 128256,
         has_position_ids: false,
-        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     qwen25_nogqa: {
         name: "Qwen2.5 0.5B Instruct (no GQA)",
         desc: "Alibaba Qwen2.5-0.5B-Instruct (standard attention, no GQA fusion)",
-        id: "Qwen/Qwen2.5-0.5B-Instruct",
+        id: "Qwen/Qwen2.5-0.5B-Instruct-noGQA",
         file_name: "model.onnx",
-        external_data_file: "8c28285e-53bd-11f1-8199-58cdc9c761b4.data",
-        local_path: "../text-generation/models/Qwen/Qwen2.5-0.5B-Instruct/",
+        external_data_file: "6fcc76e4-4358-11f1-8199-00249b29296c.data",
+        local_path: "../text-generation/models/Qwen/Qwen2.5-0.5B-Instruct-noGQA/",
         enable_additive_dim_param: false,
         remote_path: "",
         eos_token_id: [151645, 151643],
@@ -131,7 +126,6 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
-        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     llama1b_nogqa: {
@@ -150,7 +144,6 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
-        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     deepseekr1: {
@@ -170,7 +163,6 @@ const MODELS = {
         vocab_size: 151936,
         has_position_ids: false,
         enable_thinking: false,
-        enable_causallm: false,
         repetition_penalty: 1.2,
         temperature: 0.6,
         top_k: 50,
@@ -196,7 +188,6 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
-        enable_causallm: false,
         system_content: "You are a helpful assistant.",
     },
     deepseekr1_nogqa: {
@@ -216,7 +207,6 @@ const MODELS = {
         has_position_ids: true,
         use_gqa: false,
         kv_dtype: "float32",
-        enable_causallm: false,
         repetition_penalty: 1.0,
         temperature: 0.6,
         top_k: 50,
@@ -341,6 +331,7 @@ function getConfig() {
         show_special: 0,
         csv: 0,
         max_length: 512,
+        enable_causallm: 0,
         local: 0,
     };
     let vars = query.split("&");
@@ -654,7 +645,7 @@ async function loadModel(modelKey) {
             profiler: config.profiler,
             verbose: config.verbose,
             local: config.local,
-            enable_causallm: model.enable_causallm || false,
+            enable_causallm: config.enable_causallm,
         });
 
         sendButton.disabled = false;
@@ -799,14 +790,16 @@ const ui = async () => {
             logUser("Model already loaded");
             return;
         }
-        // Use custom local ORT build (with freeDimensionOverrides / ShapeSubgraphFolder)
-        // unless ?ort= is specified in URL
+        // ORT loading: ?ort=local uses ./dist/ (QDQ fix), otherwise ../../assets/dist/ (causalLM support)
+        // Other values: ort=test, ort=dev, ort=latest go through setupORT
         const ortOverride = getQueryValue("ort");
-        if (ortOverride) {
-            await setupORT("text-generation", "dev");
-        } else {
+        if (ortOverride === "local") {
             await loadScript("onnxruntime-web", "./dist/ort.webgpu.min.js");
-            log("ONNX Runtime Web: local build (with QDQ fix)");
+            log("ONNX Runtime Web: local v2 build (QDQ fix)");
+        } else if (ortOverride) {
+            await setupORT("text-generation", ortOverride);
+        } else {
+            await loadScript("onnxruntime-web", "../../assets/dist/ort.webgpu.min.js");
         }
         showCompatibleChromiumVersion("text-generation");
         ort.env.wasm.numThreads = 4;

@@ -52,12 +52,15 @@ export class LLM {
         this.numLayers = model.num_layers;
         this.kvNumHeads = model.kv_num_heads;
         this.headSize = model.head_size;
-        this.kvDims = [1, model.kv_num_heads, this.maxLength, model.head_size];
         this.vocabSize = model.vocab_size;
         this.hasPositionIds = !!model.has_position_ids;
         this.useGqa = model.use_gqa !== false; // default true (GQA models); set false for non-GQA
+        this.enableCausalLM = !!options.enable_causallm; // selects stateful (concat) vs stateless (ScatterND) KV path
         this.enableAdditiveDimParam = !!model.enable_additive_dim_param; // parse "a+b" dim expressions
         this.kvDtype = model.kv_dtype || "float16"; // KV cache & logits data type
+        this.kvDims = this.enableCausalLM
+            ? [1, model.kv_num_heads, 1, model.head_size]
+            : [1, model.kv_num_heads, this.maxLength, model.head_size];
         this.repetitionPenalty = model.repetition_penalty || 1.0;
         this.temperature = model.temperature || 0.0;
         this.topK = model.top_k || 0;
@@ -101,10 +104,10 @@ export class LLM {
                     deviceType: this.deviceType,
                     context: this.mlContext,
                     enableCausalLM: !!options.enable_causallm,
-                    enableAdditiveDimParam: this.enableAdditiveDimParam,
                     freeDimensionBounds: this.useGqa
                         ? {
                               sequence_length: { maxSize: this.maxLength },
+                              ...(this.enableCausalLM && { past_sequence_length: { maxSize: this.maxLength } }),
                               total_sequence_length: { maxSize: this.maxLength },
                           }
                         : undefined,
@@ -130,14 +133,13 @@ export class LLM {
 
         if (this.provider == "webnn") {
             if (this.useGqa) {
-                // GQA models: past_sequence_length is static (override), KV shape stays constant
-                sessionOptions.freeDimensionOverrides = {
-                    batch_size: 1,
-                    past_sequence_length: this.maxLength,
-                };
+                // Stateful (enableCausalLM): KV grows dynamically — only batch_size fixed
+                // Stateless (default): past_sequence_length pinned to maxLength, ScatterND writes in-place
+                sessionOptions.freeDimensionOverrides = this.enableCausalLM
+                    ? { batch_size: 1 }
+                    : { batch_size: 1, past_sequence_length: this.maxLength };
             } else {
-                // Non-GQA WebNN: fixed-size KV with masking (like GQA approach).
-                // All dims are static — avoids dynamic-shape GPU crashes.
+                // Non-GQA stateless (GPU): fixed-size KV with masking
                 sessionOptions.freeDimensionOverrides = {
                     batch_size: 1,
                     sequence_length: 1,
@@ -185,11 +187,13 @@ export class LLM {
             for (const name in tensors) {
                 const t = tensors[name];
                 if (t.disposer == undefined) {
-                    if (t.location == "ml-tensor") {
+                    if (t.location == "ml-tensor" && t.mlTensor) {
                         t.mlTensor.destroy();
-                    }
-                    if (t.location == "gpu-buffer") {
+                    } else if (t.location == "gpu-buffer" && t.gpuBuffer) {
                         t.gpuBuffer.destroy();
+                    } else if (t.location == "ml-tensor" && typeof t.dispose === "function") {
+                        // ORT-returned WebNN tensor without mlTensor wrapper
+                        t.dispose();
                     }
                 } else {
                     t.dispose();
@@ -208,8 +212,21 @@ export class LLM {
         this.fetches = {};
         if (this.provider == "webnn") {
             if (this.useGqa) {
-                // GQA models: KV shape is static [1, heads, maxLength, headSize]
-                // Pre-allocate fixed-size ml-tensors for both feed and fetches
+                if (this.enableCausalLM) {
+                    // Stateful GQA: seed past KV as MLTensors [1, kv_heads, 1, head_size].
+                    // WebNN rejects zero dimensions; seq=1 matches upstream support_qwen3.
+                    // ORT Concat grows the sequence dim each step.
+                    for (let i = 0; i < this.numLayers; ++i) {
+                        this.feed[`past_key_values.${i}.key`] = await createMlTensor(
+                            this.mlContext, this.kvDtype, this.kvDims, false, false);
+                        this.feed[`past_key_values.${i}.value`] = await createMlTensor(
+                            this.mlContext, this.kvDtype, this.kvDims, false, false);
+                    }
+                    // No fetches pre-allocation for stateful — ORT returns present KV in outputs
+                } else {
+                // GQA stateless: KV shape is static [1, heads, maxLength, headSize]
+                // Pre-allocate fixed-size ml-tensors for feed and fetches (GPU only).
+                // NPU: no fetches pre-allocated — ORT returns all outputs including logits via outputs[*].cpuData.
                 for (let i = 0; i < this.numLayers; ++i) {
                     this.feed[`past_key_values.${i}.key`] = await createMlTensor(
                         this.mlContext,
@@ -226,29 +243,33 @@ export class LLM {
                         false,
                     );
 
-                    this.fetches[`present.${i}.key`] = await createMlTensor(
-                        this.mlContext,
-                        this.kvDtype,
-                        this.kvDims,
-                        false,
-                        false,
-                    );
-                    this.fetches[`present.${i}.value`] = await createMlTensor(
-                        this.mlContext,
-                        this.kvDtype,
-                        this.kvDims,
-                        false,
-                        false,
-                    );
+                    if (this.deviceType !== "npu") {
+                        this.fetches[`present.${i}.key`] = await createMlTensor(
+                            this.mlContext,
+                            this.kvDtype,
+                            this.kvDims,
+                            false,
+                            false,
+                        );
+                        this.fetches[`present.${i}.value`] = await createMlTensor(
+                            this.mlContext,
+                            this.kvDtype,
+                            this.kvDims,
+                            false,
+                            false,
+                        );
+                    }
                 }
+                } // end stateless GQA
             } else {
-                // Non-GQA WebNN: GPU-resident fixed-size KV with slice graph.
-                // Pre-allocate MLTensors for both past (feed) and present (fetches).
-                // A WebNN slice graph updates past from present each step (GPU-to-GPU, no CPU roundtrip).
+                // Non-GQA: fixed-size KV.
+                // GPU: MLTensor present outputs + WebNN slice graph (GPU-to-GPU).
+                // NPU: CPU ORT Tensor present outputs (ORT copies NPU→CPU) + CPU slice + writeTensor.
                 const pastSeqLen = this.maxLength - 1;
                 const presentSeqLen = this.maxLength;
                 const pastDims = [1, this.kvNumHeads, pastSeqLen, this.headSize];
                 const presentDims = [1, this.kvNumHeads, presentSeqLen, this.headSize];
+                const TypedArray = this.kvDtype === "float16" ? Float16Array : Float32Array;
 
                 for (let i = 0; i < this.numLayers; ++i) {
                     this.feed[`past_key_values.${i}.key`] = await createMlTensor(
@@ -256,40 +277,51 @@ export class LLM {
                     this.feed[`past_key_values.${i}.value`] = await createMlTensor(
                         this.mlContext, this.kvDtype, pastDims, true, false);
 
-                    this.fetches[`present.${i}.key`] = await createMlTensor(
-                        this.mlContext, this.kvDtype, presentDims, false, true);
-                    this.fetches[`present.${i}.value`] = await createMlTensor(
-                        this.mlContext, this.kvDtype, presentDims, false, true);
+                    if (this.deviceType !== "npu") {
+                        // GPU: pre-allocate MLTensors for zero-copy slice graph dispatch
+                        this.fetches[`present.${i}.key`] = await createMlTensor(
+                            this.mlContext, this.kvDtype, presentDims, false, true);
+                        this.fetches[`present.${i}.value`] = await createMlTensor(
+                            this.mlContext, this.kvDtype, presentDims, false, true);
+                    }
+                    // NPU: no present fetch pre-allocation — ORT returns present KV in outputs, read via outputs[*].cpuData
                 }
 
                 // Zero-fill all past KV tensors
                 const kvElements = this.kvNumHeads * pastSeqLen * this.headSize;
-                const kvZeros = this.kvDtype === "float16" ? new Float16Array(kvElements) : new Float32Array(kvElements);
+                const kvZeros = new TypedArray(kvElements);
                 for (let i = 0; i < this.numLayers; ++i) {
                     await this.mlContext.writeTensor(this.feed[`past_key_values.${i}.key`].mlTensor, kvZeros);
                     await this.mlContext.writeTensor(this.feed[`past_key_values.${i}.value`].mlTensor, kvZeros);
                 }
 
-                // Build a WebNN slice graph: present[1:] → past (GPU-to-GPU)
-                const builder = new MLGraphBuilder(this.mlContext);
-                const sliceInput = builder.input('present', {
-                    dataType: this.kvDtype === "float16" ? 'float16' : 'float32',
-                    shape: presentDims
-                });
-                const sliceOutput = builder.slice(sliceInput, [0, 0, 1, 0], pastDims);
-                this.kvSliceGraph = await builder.build({ 'past': sliceOutput });
-                log(`GPU KV slice graph built: [1,${this.kvNumHeads},${presentSeqLen},${this.headSize}] → [1,${this.kvNumHeads},${pastSeqLen},${this.headSize}]`);
+                if (this.deviceType !== "npu") {
+                    // GPU: build WebNN slice graph: present[1:] → past (GPU-to-GPU)
+                    const builder = new MLGraphBuilder(this.mlContext);
+                    const sliceInput = builder.input('present', {
+                        dataType: this.kvDtype === "float16" ? 'float16' : 'float32',
+                        shape: presentDims
+                    });
+                    const sliceOutput = builder.slice(sliceInput, [0, 0, 1, 0], pastDims);
+                    this.kvSliceGraph = await builder.build({ 'past': sliceOutput });
+                    log(`GPU KV slice graph built`);
+                } else {
+                    this.kvSliceGraph = null;
+                    log(`NPU: using CPU ORT Tensor present KV outputs + writeTensor for KV update`);
+                }
 
                 this.startLength = 0;
             }
-            // Pre-allocate logits MLTensor for both GQA and non-GQA WebNN paths
-            this.fetches["logits"] = await createMlTensor(
-                this.mlContext,
-                this.kvDtype,
-                [1, 1, this.vocabSize],
-                false,
-                true,
-            );
+
+            if (this.deviceType !== "npu") {
+                this.fetches["logits"] = await createMlTensor(
+                    this.mlContext,
+                    this.kvDtype,
+                    [1, 1, this.vocabSize],
+                    false,
+                    true,
+                );
+            }
         } else if (this.provider == "webgpu") {
             // Pre-allocate kv cache gpu-buffer
             const numElements = this.kvDims.reduce((a, b) => a * b, 1);
@@ -339,7 +371,7 @@ export class LLM {
     }
 
     // Update key value cache
-    updateKvCache(outputs) {
+    async updateKvCache(outputs) {
         if (this.provider == "webnn" && !this.useGqa && this.kvSliceGraph) {
             // GPU-resident KV: dispatch slice graph for each layer's present → past (GPU-to-GPU)
             for (let i = 0; i < this.numLayers; ++i) {
@@ -353,6 +385,29 @@ export class LLM {
                     { 'present': this.fetches[`present.${i}.value`].mlTensor },
                     { 'past': this.feed[`past_key_values.${i}.value`].mlTensor }
                 );
+            }
+            return;
+        }
+
+        if (this.provider == "webnn" && !this.useGqa && this.deviceType === "npu") {
+            // NPU non-GQA: present KV are CPU ORT Tensors — read cpuData directly, slice per head, write into past MLTensors
+            const pastSeqLen = this.maxLength - 1;
+            const pastElements = this.kvNumHeads * pastSeqLen * this.headSize;
+            const TypedArray = this.kvDtype === "float16" ? Float16Array : Float32Array;
+            const pastBuf = new TypedArray(pastElements);
+            for (let i = 0; i < this.numLayers; ++i) {
+                for (const slot of ['key', 'value']) {
+                    const presentBuf = outputs[`present.${i}.${slot}`]?.cpuData;
+                    if (!presentBuf) continue;
+                    // present shape: [1, kvNumHeads, maxLength, headSize] row-major
+                    // slice [0,0,1,0] → [1, kvNumHeads, maxLength-1, headSize]: skip seq pos 0 per head
+                    for (let h = 0; h < this.kvNumHeads; ++h) {
+                        const srcOff = h * this.maxLength * this.headSize + this.headSize;
+                        const dstOff = h * pastSeqLen * this.headSize;
+                        pastBuf.set(presentBuf.subarray(srcOff, srcOff + pastSeqLen * this.headSize), dstOff);
+                    }
+                    await this.mlContext.writeTensor(this.feed[`past_key_values.${i}.${slot}`].mlTensor, pastBuf);
+                }
             }
             return;
         }
@@ -521,16 +576,15 @@ export class LLM {
         let attnMask;
 
         if (this.provider == "webnn" && !this.useGqa) {
-            // Non-GQA GPU-resident KV path: prefill token-by-token with MLTensor buffers.
-            // attention_mask is always [1, maxLength] with left-padded zeros, right-aligned ones.
+            // Non-GQA: token-by-token prefill.
+            // GPU: fixed-size [1, maxLength] attention mask with left-padded zeros.
+            // NPU: growing attention mask, present KV returned as CPU ORT Tensors.
             for (let i = 0; i < inputIdsLen; ++i) {
                 this.feed["input_ids"] = new ort.Tensor("int64", BigInt64Array.from([inputIds[i]]), [1, 1]);
-                // Build fixed-size mask: zeros for empty positions, ones for real tokens + current
-                const numReal = this.startLength + 1; // tokens processed so far + current
+                // Fixed-size mask [1, maxLength] with left-padded zeros for both GPU and NPU
+                const numReal = this.startLength + 1;
                 const mask = new BigInt64Array(this.maxLength);
-                for (let j = this.maxLength - numReal; j < this.maxLength; j++) {
-                    mask[j] = 1n;
-                }
+                for (let j = this.maxLength - numReal; j < this.maxLength; j++) mask[j] = 1n;
                 this.feed["attention_mask"] = new ort.Tensor("int64", mask, [1, this.maxLength]);
                 if (this.hasPositionIds) {
                     this.feed["position_ids"] = new ort.Tensor(
@@ -549,9 +603,12 @@ export class LLM {
                     },
                 );
 
-                // Logits written to pre-allocated MLTensor — read back from GPU
-                await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.logitsBuffer);
-                this.updateKvCache(outputs);
+                if (this.deviceType === "npu") {
+                    this.logitsBuffer = outputs["logits"].cpuData;
+                } else {
+                    await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.logitsBuffer);
+                }
+                await this.updateKvCache(outputs);
                 this.startLength++;
             }
         } else {
@@ -572,8 +629,11 @@ export class LLM {
             });
 
             if (this.provider == "webnn") {
-                // GQA path: logits in pre-allocated MLTensor
-                await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.logitsBuffer);
+                if (this.deviceType === "npu") {
+                    this.logitsBuffer = outputs["logits"].cpuData;
+                } else {
+                    await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.logitsBuffer);
+                }
             } else if (this.provider == "webgpu") {
                 const logitBytes = this.vocabSize * (this.kvDtype === "float16" ? 2 : 4);
                 await readBackGpuTensor(
@@ -587,7 +647,7 @@ export class LLM {
             }
 
             this.startLength = this.startLength + inputIdsLen;
-            this.updateKvCache(outputs);
+            await this.updateKvCache(outputs);
         }
 
         this.applyRepetitionPenalty(this.logitsBuffer, this.vocabSize, this.outputTokens, this.repetitionPenalty);
@@ -605,7 +665,7 @@ export class LLM {
         while (this.eos.indexOf(lastToken) == -1 && !this.stop && this.startLength < this.maxLength) {
             this.feed["input_ids"] = new ort.Tensor("int64", BigInt64Array.from([BigInt(lastToken)]), [1, 1]);
             if (this.provider == "webnn" && !this.useGqa) {
-                // Fixed-size mask for non-GQA WebNN (GPU-resident KV)
+                // Fixed-size mask [1, maxLength] for non-GQA WebNN path (GPU and NPU)
                 const numReal = this.startLength + 1;
                 const mask = new BigInt64Array(this.maxLength);
                 for (let j = this.maxLength - numReal; j < this.maxLength; j++) {
@@ -628,8 +688,11 @@ export class LLM {
                     model: "decode",
                     iteration: this.outputTokens.length,
                 });
-                // Both GQA and non-GQA: logits in pre-allocated MLTensor
-                await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.logitsBuffer);
+                if (this.deviceType === "npu") {
+                    this.logitsBuffer = outputs["logits"].cpuData;
+                } else {
+                    await readBackMLTensor(this.mlContext, this.fetches["logits"].mlTensor, this.logitsBuffer);
+                }
             } else if (this.provider == "webgpu") {
                 if (!this.fetches["logits"]) {
                     // Pre-allocate logits gpu-buffer once
