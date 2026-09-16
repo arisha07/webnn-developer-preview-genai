@@ -1,0 +1,2099 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebNN Developer Preview - Noise Suppression</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="../../assets/favicon/favicon-32x32.png">
+  <link rel="stylesheet" href="../../assets/css/style.css">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 0 20px;
+      line-height: 1.6;
+      background: #f5f5f5;
+    }
+    h1 { color: #333; margin-bottom: 10px; }
+    .subtitle { color: #666; font-size: 14px; margin-bottom: 30px; }
+    .card {
+      background: white;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 18px;
+      color: #333;
+      border-bottom: 2px solid #e0e0e0;
+      padding-bottom: 10px;
+    }
+    .control-group {
+      margin-bottom: 15px;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 5px;
+      color: #555;
+    }
+    select, input[type="range"], input[type="file"], button {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    select { background: white; cursor: pointer; }
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #0056b3; }
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    .range-value {
+      display: inline-block;
+      min-width: 60px;
+      text-align: right;
+      font-weight: 600;
+      color: #007bff;
+    }
+    .warning {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 4px;
+      padding: 10px;
+      margin-bottom: 15px;
+      color: #856404;
+      font-size: 14px;
+    }
+    .warning::before {
+      content: "⚠️ ";
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-left: 10px;
+    }
+    .badge-success { background: #d4edda; color: #155724; }
+    .badge-warning { background: #fff3cd; color: #856404; }
+    .badge-error { background: #f8d7da; color: #721c24; }
+    .badge-info { background: #d1ecf1; color: #0c5460; }
+    #log {
+      background: #1e1e1e;
+      color: #d4d4d4;
+      padding: 15px;
+      border-radius: 4px;
+      font-family: "Consolas", "Monaco", monospace;
+      font-size: 13px;
+      max-height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .hidden { display: none; }
+    audio {
+      width: 100%;
+      margin-top: 10px;
+    }
+    .progress-container {
+      margin: 15px 0;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 24px;
+      background: #e0e0e0;
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #28a745, #20c997);
+      width: 0%;
+      transition: width 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 600;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="grid-2-41 v1 demo-shell-header">
+    <h1 class="title">
+      <div id="back"><a href="../../" aria-label="Back to demos">
+        <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 -960 960 960" width="24"><path d="m313-440 224 224-57 56-320-320 320-320 57 56-224 224h487v80H313Z" /></svg>
+      </a></div>
+      <img id="webnn-logo" src="../../assets/img/logo-webnn-dark.svg" alt="WebNN logo">
+      <span id="title">WebNN</span> <span id="model">Noise Suppression</span>
+    </h1>
+    <div id="badge" class="cpu">
+      <div class="badge-text"><span>Powered by</span><div id="device">WebNN</div></div>
+      <div class="tiles"><div class="tile t0"></div><div class="tile t1"></div><div class="tile t2"></div><div class="tile t1"></div><div class="tile t2"></div><div class="tile t3"></div><div class="tile t2"></div><div class="tile t3"></div><div class="tile t4"></div></div>
+    </div>
+  </div>
+  <div class="subtitle">AI-powered noise suppression running locally in your browser via WebNN/WebGPU/WASM</div>
+
+  <!-- Configuration -->
+  <div class="card">
+    <h2>Configuration</h2>
+
+    <div class="control-group">
+      <label for="model-select">Model:</label>
+      <select id="model-select">
+        <option value="df3">DeepFilterNet3</option>
+      </select>
+    </div>
+
+    <div class="control-group">
+      <label for="backend-select">Backend:</label>
+      <select id="backend-select" disabled>
+        <option value="auto">Auto (recommended)</option>
+      </select>
+    </div>
+
+    <div id="wasm-warning" class="warning hidden">
+      Processing will use CPU and may be slower than hardware-accelerated backends.
+      Consider using Chrome 120+ on Intel hardware for optimal performance.
+    </div>
+
+    <div class="control-group">
+      <label for="attenuation-slider">
+        Attenuation: <span class="range-value" id="attenuation-value">20 dB</span>
+      </label>
+      <input type="range" id="attenuation-slider" min="0" max="40" value="20" step="1">
+    </div>
+
+    <div class="control-group" id="postfilter-group" style="display: block;">
+      <label>
+        <input type="checkbox" id="postfilter-checkbox" style="width: auto; margin-right: 8px;">
+        Enable post-filter (slower but cleaner)
+      </label>
+    </div>
+
+    <div class="control-group">
+      <button id="load-model-btn" disabled>Load Model</button>
+      <div id="model-status" style="margin-top: 8px; color: #666; font-size: 13px;">Model not loaded.</div>
+    </div>
+  </div>
+
+  <!-- File Input -->
+  <div class="card">
+    <h2>Audio Input</h2>
+    <div class="control-group">
+      <label for="audio-input">Select WAV file:</label>
+      <input type="file" id="audio-input" accept=".wav,audio/wav" disabled>
+    </div>
+    <div id="input-info" class="hidden" style="margin-top: 10px; color: #666; font-size: 14px;"></div>
+    <audio id="input-audio" controls class="hidden"></audio>
+    <canvas id="input-waveform" aria-label="Input audio waveform" class="hidden" style="display: block; width: 100%; height: 96px; margin-top: 10px; border: 1px solid #e0e0e0; cursor: pointer;"></canvas>
+  </div>
+
+  <!-- Processing -->
+  <div class="card">
+    <h2>Processing</h2>
+    <button id="process-btn" disabled>Load Audio First</button>
+    <div id="progress-container" class="progress-container hidden">
+      <div class="progress-bar">
+        <div class="progress-bar-fill" id="progress-fill">0%</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Output -->
+  <div class="card">
+    <h2>Processed Audio</h2>
+    <audio id="output-audio" controls class="hidden"></audio>
+    <canvas id="output-waveform" aria-label="Processed audio waveform" class="hidden" style="display: block; width: 100%; height: 96px; margin-top: 10px; border: 1px solid #e0e0e0; cursor: pointer;"></canvas>
+    <button id="download-btn" class="hidden" style="margin-top: 10px;">Download Processed WAV</button>
+  </div>
+
+  <div class="footerinfo demo-shell-footer">
+    <div id="webnnstatus">
+      <span id="circle"></span>
+      <span id="info">WebNN supported · <a href="?devicetype=gpu">GPU</a> · <a href="?devicetype=npu">NPU</a></span>
+    </div>
+    <div id="versions">
+      <div>Known compatible Chromium version: <a href="https://github.com/microsoft/webnn-developer-preview#breaking-changes">136.0.7051.0</a></div>
+      <div>ONNX Runtime Web: <a href="https://www.npmjs.com/package/onnxruntime-web/v/1.27.0-dev.20260506-673c3320fc?activeTab=versions">1.27.0-dev.20260506-673c3320fc</a></div>
+    </div>
+  </div>
+
+  <script type="module">
+    // ============================================================================
+    // DSP CONSTANTS
+    // ============================================================================
+
+    const LOOKAHEAD = 2;
+    const NB_DF = 96;
+    const FRAME_SIZE = 480;
+    const FFT_SIZE = 960;
+    const SAMPLE_RATE = 48000;
+    const NB_ERB = 32;
+    const NUM_FREQS = 481;
+
+    function updateBackendBadge(backend) {
+      const badge = document.getElementById('badge');
+      const device = document.getElementById('device');
+      const normalized = String(backend || '').toLowerCase();
+      const label = normalized.includes('npu') ? 'NPU'
+        : normalized.includes('gpu') || normalized === 'auto' ? 'GPU'
+          : 'CPU';
+      device.textContent = label;
+      badge.className = label === 'NPU' ? 'npu' : label === 'CPU' ? 'cpu' : '';
+    }
+
+    // ============================================================================
+    // UTILITIES
+    // ============================================================================
+
+    const log = (message) => {
+      console.log(message);
+    };
+
+    const showWarning = (show) => {
+      const warningEl = document.getElementById('wasm-warning');
+      if (show) {
+        warningEl.classList.remove('hidden');
+      } else {
+        warningEl.classList.add('hidden');
+      }
+    };
+
+    // ============================================================================
+    // FFT IMPLEMENTATION (Radix-2 Cooley-Tukey)
+    // ============================================================================
+
+    // FFT using Bluestein's algorithm - supports arbitrary size N
+    // Works by expressing N-point DFT as convolution of length M >= 2N-1 (power of 2)
+    class FFT {
+      constructor(size) {
+        this.size = size;
+        this.fftSize = size; // For external use (no zero-padding now)
+
+        // For Bluestein: need M = next power of 2 >= 2N - 1
+        this.m = 1;
+        while (this.m < 2 * size - 1) this.m *= 2;
+
+        // Precompute chirp sequence w[n] = exp(-i * pi * n^2 / N)
+        this.chirpReal = new Float32Array(size);
+        this.chirpImag = new Float32Array(size);
+        for (let i = 0; i < size; i++) {
+          // Use modular arithmetic to avoid precision loss for large i
+          const angle = -Math.PI * ((i * i) % (2 * size)) / size;
+          this.chirpReal[i] = Math.cos(angle);
+          this.chirpImag[i] = Math.sin(angle);
+        }
+
+        // Precompute B[n] = conj(w[n]) for convolution, zero-padded and wrapped
+        this.bReal = new Float32Array(this.m);
+        this.bImag = new Float32Array(this.m);
+        // B[0..N-1] = conj(chirp[0..N-1])
+        for (let i = 0; i < size; i++) {
+          this.bReal[i] = this.chirpReal[i];
+          this.bImag[i] = -this.chirpImag[i];
+        }
+        // B[M-N+1..M-1] = conj(chirp[N-1..1]) (reverse, skip 0)
+        for (let i = 1; i < size; i++) {
+          this.bReal[this.m - i] = this.chirpReal[i];
+          this.bImag[this.m - i] = -this.chirpImag[i];
+        }
+
+        // Precompute FFT of B using radix-2
+        this._buildRadix2Tables(this.m);
+        this.bFftReal = new Float32Array(this.bReal);
+        this.bFftImag = new Float32Array(this.bImag);
+        this._radix2Fft(this.bFftReal, this.bFftImag, false);
+      }
+
+      _buildRadix2Tables(n) {
+        this.r2Cos = new Float32Array(n / 2);
+        this.r2Sin = new Float32Array(n / 2);
+        for (let i = 0; i < n / 2; i++) {
+          const angle = -2 * Math.PI * i / n;
+          this.r2Cos[i] = Math.cos(angle);
+          this.r2Sin[i] = Math.sin(angle);
+        }
+      }
+
+      _radix2Fft(real, imag, inverse) {
+        const n = real.length;
+        const levels = Math.log2(n);
+
+        for (let i = 0; i < n; i++) {
+          let j = 0;
+          let x = i;
+          for (let k = 0; k < levels; k++) {
+            j = (j << 1) | (x & 1);
+            x >>>= 1;
+          }
+          if (j > i) {
+            [real[i], real[j]] = [real[j], real[i]];
+            [imag[i], imag[j]] = [imag[j], imag[i]];
+          }
+        }
+
+        for (let size = 2; size <= n; size *= 2) {
+          const halfsize = size / 2;
+          const tablestep = n / size;
+
+          for (let i = 0; i < n; i += size) {
+            for (let j = i, k = 0; j < i + halfsize; j++, k += tablestep) {
+              const l = j + halfsize;
+              const cos = this.r2Cos[k];
+              const sin = inverse ? -this.r2Sin[k] : this.r2Sin[k];
+              const tpre = real[l] * cos - imag[l] * sin;
+              const tpim = real[l] * sin + imag[l] * cos;
+              real[l] = real[j] - tpre;
+              imag[l] = imag[j] - tpim;
+              real[j] += tpre;
+              imag[j] += tpim;
+            }
+          }
+        }
+      }
+
+      _bluesteinFft(inReal, inImag, inverse) {
+        const n = this.size;
+        const m = this.m;
+
+        // A[n] = x[n] * w[n] (for inverse, w[n] is conjugated)
+        const aReal = new Float32Array(m);
+        const aImag = new Float32Array(m);
+        for (let i = 0; i < n; i++) {
+          const cr = this.chirpReal[i];
+          const ci = inverse ? -this.chirpImag[i] : this.chirpImag[i];
+          aReal[i] = inReal[i] * cr - inImag[i] * ci;
+          aImag[i] = inReal[i] * ci + inImag[i] * cr;
+        }
+
+        // FFT of A
+        this._radix2Fft(aReal, aImag, false);
+
+        // For inverse, we need FFT of conj(B) which means we use bFft differently
+        let bfR, bfI;
+        if (inverse) {
+          bfR = new Float32Array(m);
+          bfI = new Float32Array(m);
+          for (let i = 0; i < m; i++) {
+            // FFT of conj(b) = conj(reverse(FFT(b)))... actually just recompute
+            bfR[i] = this.bReal[i];
+            bfI[i] = -this.bImag[i];
+          }
+          this._radix2Fft(bfR, bfI, false);
+        } else {
+          bfR = this.bFftReal;
+          bfI = this.bFftImag;
+        }
+
+        // Pointwise multiply A * B
+        for (let i = 0; i < m; i++) {
+          const ar = aReal[i], ai = aImag[i];
+          const br = bfR[i], bi = bfI[i];
+          aReal[i] = ar * br - ai * bi;
+          aImag[i] = ar * bi + ai * br;
+        }
+
+        // Inverse FFT
+        this._radix2Fft(aReal, aImag, true);
+        const invM = 1.0 / m;
+        for (let i = 0; i < m; i++) {
+          aReal[i] *= invM;
+          aImag[i] *= invM;
+        }
+
+        // Final multiply by chirp: y[k] = a[k] * w[k]
+        const outReal = new Float32Array(n);
+        const outImag = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          const cr = this.chirpReal[i];
+          const ci = inverse ? -this.chirpImag[i] : this.chirpImag[i];
+          outReal[i] = aReal[i] * cr - aImag[i] * ci;
+          outImag[i] = aReal[i] * ci + aImag[i] * cr;
+        }
+
+        return { real: outReal, imag: outImag };
+      }
+
+      forward(input) {
+        const n = this.size;
+        const inReal = new Float32Array(n);
+        const inImag = new Float32Array(n);
+        for (let i = 0; i < n && i < input.length; i++) {
+          inReal[i] = input[i];
+        }
+        return this._bluesteinFft(inReal, inImag, false);
+      }
+
+      inverse(real, imag) {
+        const n = this.size;
+        const inReal = new Float32Array(n);
+        const inImag = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          inReal[i] = real[i] || 0;
+          inImag[i] = imag[i] || 0;
+        }
+        const result = this._bluesteinFft(inReal, inImag, true);
+        const scale = 1.0 / n;
+        const output = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          output[i] = result.real[i] * scale;
+        }
+        return output;
+      }
+    }
+
+    // ============================================================================
+    // WINDOW FUNCTIONS
+    // ============================================================================
+
+    function createVorbisWindow(size) {
+      const window = new Float32Array(size);
+      for (let i = 0; i < size; i++) {
+        const x = Math.sin(Math.PI * i / size);
+        window[i] = Math.sin(Math.PI / 2 * x * x);
+      }
+      return window;
+    }
+
+    // ============================================================================
+    // ERB FILTERBANK (matches C++ reference)
+    // ============================================================================
+
+    // Hardcoded ERB band widths (in FFT bins) from C++ reference
+    const ERB_INDICES = [
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 5, 5, 7, 7, 8,
+      10, 12, 13, 15, 18, 20, 24, 28, 31, 37, 42, 50, 56, 67
+    ];
+
+    // Build ERB start indices (cumulative sum with 0 prepended)
+    function buildErbBandIndices() {
+      const starts = [0];
+      for (let i = 0; i < ERB_INDICES.length; i++) {
+        starts.push(starts[i] + ERB_INDICES[i]);
+      }
+      return starts; // length 33, last is 481
+    }
+
+    const ERB_BAND_STARTS = buildErbBandIndices();
+
+    // Apply ERB filterbank: average mag_squared within each band
+    function applyErbFilterbank(magSquared) {
+      const erbFeat = new Float32Array(NB_ERB);
+      for (let band = 0; band < NB_ERB; band++) {
+        const start = ERB_BAND_STARTS[band];
+        const end = ERB_BAND_STARTS[band + 1];
+        const width = ERB_INDICES[band];
+        let sum = 0;
+        for (let i = start; i < end; i++) {
+          sum += magSquared[i];
+        }
+        erbFeat[band] = sum / width;
+      }
+      return erbFeat;
+    }
+
+    // Expand ERB mask (32 bands) to full spectrum (481 bins) via inverse filterbank
+    // C++: mask.matmul(_erb_inv_fb) - equivalent to repeating each band value across its bins
+    function expandErbMask(erbMask32) {
+      const fullMask = new Float32Array(NUM_FREQS);
+      for (let band = 0; band < NB_ERB; band++) {
+        const start = ERB_BAND_STARTS[band];
+        const end = ERB_BAND_STARTS[band + 1];
+        const value = erbMask32[band];
+        for (let i = start; i < end; i++) {
+          fullMask[i] = value;
+        }
+      }
+      return fullMask;
+    }
+
+    // ============================================================================
+    // NORMALIZATION (matches C++ reference)
+    // ============================================================================
+
+    // ERB norm: convert to dB, then mean-subtract with EMA state
+    // C++: state = lerp(xs, state, alpha); out = (xs - state) / 40
+    // lerp(a, b, t) = a + t*(b-a), so lerp(xs, state, alpha) = xs + alpha*(state-xs) = alpha*state + (1-alpha)*xs
+    function erbNormalizeDb(erbFeatLinear, state, alpha = 0.99) {
+      const normalized = new Float32Array(NB_ERB);
+      for (let i = 0; i < NB_ERB; i++) {
+        const db = 10 * Math.log10(erbFeatLinear[i] + 1e-10);
+        state[i] = alpha * state[i] + (1 - alpha) * db;
+        normalized[i] = (db - state[i]) / 40.0;
+      }
+      return normalized;
+    }
+
+    // Unit norm: state tracks |xs| via EMA, then divide by sqrt(state)
+    // C++: state = lerp(|xs|, state, alpha); out = xs / sqrt(state)
+    function unitNormalize(specFeat, state, alpha = 0.99) {
+      const normalized = new Float32Array(NB_DF * 2);
+      for (let i = 0; i < NB_DF; i++) {
+        const re = specFeat[i * 2];
+        const im = specFeat[i * 2 + 1];
+        const mag = Math.sqrt(re * re + im * im);
+        state[i] = alpha * state[i] + (1 - alpha) * mag;
+        const denom = Math.sqrt(state[i]) + 1e-10;
+        normalized[i * 2] = re / denom;
+        normalized[i * 2 + 1] = im / denom;
+      }
+      return normalized;
+    }
+
+    // ============================================================================
+    // AUDIO RESAMPLING
+    // ============================================================================
+
+    async function resampleAudio(audioBuffer, targetSampleRate) {
+      if (audioBuffer.sampleRate === targetSampleRate) {
+        return audioBuffer;
+      }
+
+      const offlineContext = new OfflineAudioContext(
+        audioBuffer.numberOfChannels,
+        Math.ceil(audioBuffer.duration * targetSampleRate),
+        targetSampleRate
+      );
+
+      const source = offlineContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(offlineContext.destination);
+      source.start(0);
+
+      return await offlineContext.startRendering();
+    }
+
+    // ============================================================================
+    // OPFS (Origin Private File System) CACHING
+    // ============================================================================
+
+    async function getOPFSRoot() {
+      return await navigator.storage.getDirectory();
+    }
+
+    async function readFromOPFS(path) {
+      try {
+        const root = await getOPFSRoot();
+        const parts = path.split('/').filter(p => p);
+        let current = root;
+
+        for (let i = 0; i < parts.length - 1; i++) {
+          current = await current.getDirectoryHandle(parts[i]);
+        }
+
+        const fileHandle = await current.getFileHandle(parts[parts.length - 1]);
+        const file = await fileHandle.getFile();
+        return await file.arrayBuffer();
+      } catch (err) {
+        return null;
+      }
+    }
+
+    async function writeToOPFS(path, arrayBuffer) {
+      try {
+        const root = await getOPFSRoot();
+        const parts = path.split('/').filter(p => p);
+        let current = root;
+
+        for (let i = 0; i < parts.length - 1; i++) {
+          current = await current.getDirectoryHandle(parts[i], { create: true });
+        }
+
+        const fileHandle = await current.getFileHandle(parts[parts.length - 1], { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(arrayBuffer);
+        await writable.close();
+        return true;
+      } catch (err) {
+        log('✗ OPFS write failed: ' + err.message);
+        return false;
+      }
+    }
+
+    // ============================================================================
+    // MODEL LOADING
+    // ============================================================================
+
+    const MODEL_CONFIGS = {
+      df3: {
+        urls: {
+          encoder: './models/df3/enc.onnx',
+          decoder: './models/df3/df_dec.onnx',
+          erb_decoder: './models/df3/erb_dec.onnx'
+        },
+        opfsPaths: {
+          encoder: 'models/df3/enc.onnx',
+          decoder: 'models/df3/df_dec.onnx',
+          erb_decoder: 'models/df3/erb_dec.onnx'
+        }
+      }
+    };
+
+    async function loadModel(modelName, url, opfsPath) {
+      log(`Loading ${modelName}...`);
+
+      // Try OPFS cache first
+      let modelBuffer = await readFromOPFS(opfsPath);
+
+      if (modelBuffer) {
+        log(`✓ ${modelName} loaded from cache (${(modelBuffer.byteLength / 1024 / 1024).toFixed(1)} MB)`);
+        return modelBuffer;
+      }
+
+      // Cache miss - fetch from network
+      log(`Cache miss - downloading ${modelName} from ${url}`);
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        modelBuffer = await response.arrayBuffer();
+        log(`✓ ${modelName} downloaded (${(modelBuffer.byteLength / 1024 / 1024).toFixed(1)} MB)`);
+
+        // Cache it
+        const cached = await writeToOPFS(opfsPath, modelBuffer);
+        if (cached) {
+          log(`✓ ${modelName} cached to OPFS`);
+        }
+
+        return modelBuffer;
+      } catch (err) {
+        throw new Error(`Failed to load ${modelName}: ${err.message}`);
+      }
+    }
+
+    // ============================================================================
+    // SESSION CREATION WITH BACKEND CASCADE
+    // ============================================================================
+
+    async function createSessionWithBackend(modelBuffer, modelName, backendPreference, capabilities, numFrames) {
+      const BACKEND_CASCADE = [
+        { name: 'webnn', deviceType: 'npu', available: capabilities.webnn_npu },
+        { name: 'webnn', deviceType: 'gpu', available: capabilities.webnn_gpu },
+        { name: 'webgpu', available: capabilities.webgpu },
+        { name: 'wasm', available: true }
+      ];
+
+      // If user selected specific backend, try only that one
+      let backendList = BACKEND_CASCADE;
+      if (backendPreference !== 'auto') {
+        const preferredBackend = BACKEND_CASCADE.find(b =>
+          (b.deviceType && b.deviceType === backendPreference) ||
+          (b.name === backendPreference && !b.deviceType)
+        );
+        if (preferredBackend) {
+          backendList = [preferredBackend];
+        }
+      }
+
+      // Try each backend in order
+      for (const backend of backendList) {
+        if (!backend.available) continue;
+
+        try {
+          const backendName = backend.deviceType
+            ? `${backend.name}-${backend.deviceType}`
+            : backend.name;
+
+          const freeDimMsg = (numFrames && backend.name === 'webnn') ? ` (S=${numFrames})` : '';
+          log(`Trying ${modelName} with ${backendName}${freeDimMsg}...`);
+
+          const sessionOptions = {
+            executionProviders: [],
+            logSeverityLevel: backend.name === 'webnn' ? 0 : 3,
+            logVerbosityLevel: backend.name === 'webnn' ? 1 : 0,
+            ...(numFrames && backend.name === 'webnn' ? { freeDimensionOverrides: { S: numFrames } } : {})
+          };
+
+          // Create MLContext for WebNN
+          if (backend.name === 'webnn') {
+            const mlContext = await navigator.ml.createContext({
+              deviceType: backend.deviceType
+            });
+            sessionOptions.executionProviders.push({
+              name: 'webnn',
+              deviceType: backend.deviceType,
+              context: mlContext
+            });
+          } else {
+            sessionOptions.executionProviders.push({ name: backend.name });
+          }
+
+          const session = await ort.InferenceSession.create(modelBuffer, sessionOptions);
+
+          log(`✓ ${modelName} session created with ${backendName}`);
+          return { session, backend: backendName };
+
+        } catch (err) {
+          const backendName = backend.deviceType
+            ? `${backend.name}-${backend.deviceType}`
+            : backend.name;
+          log(`✗ ${backendName} failed for ${modelName}: ${err.message}`);
+          continue;
+        }
+      }
+
+      throw new Error(`All backends failed for ${modelName}`);
+    }
+
+    // ============================================================================
+    // MODEL SESSION POOL
+    // ============================================================================
+
+    let modelSessions = null;
+    let modelBufferBundle = null;
+    let modelBufferKey = '';
+    const modelSessionCache = new Map();
+
+    async function loadModelBuffers(modelType, backendPreference) {
+      const config = MODEL_CONFIGS[modelType];
+      log(`Starting model loading (${modelType.toUpperCase()})...`);
+      const startTime = performance.now();
+      const isWebnnBackend = backendPreference === 'npu' || backendPreference === 'gpu';
+      const useVariant = isWebnnBackend && modelType === 'df3';
+
+      try {
+        let [encoderBuffer, decoderBuffer, erbDecoderBuffer] = await Promise.all([
+          loadModel(`${modelType}-encoder`, config.urls.encoder, config.opfsPaths.encoder),
+          loadModel(`${modelType}-decoder`, config.urls.decoder, config.opfsPaths.decoder),
+          loadModel(`${modelType}-erb_decoder`, config.urls.erb_decoder, config.opfsPaths.erb_decoder)
+        ]);
+        if (useVariant) {
+          log(`Loading *.webnn.onnx variants (GRU rewrite) for WebNN backend`);
+          const fetchVariant = async (url) => {
+            const res = await fetch(url, { cache: 'no-store' });
+            if (!res.ok) throw new Error(`variant ${url}: ${res.status}`);
+            return await res.arrayBuffer();
+          };
+          [encoderBuffer, decoderBuffer, erbDecoderBuffer] = await Promise.all([
+            fetchVariant(config.urls.encoder.replace('.onnx', '.webnn.onnx')),
+            fetchVariant(config.urls.decoder.replace('.onnx', '.webnn.onnx')),
+            fetchVariant(config.urls.erb_decoder.replace('.onnx', '.webnn.onnx'))
+          ]);
+        }
+
+        const elapsedTime = ((performance.now() - startTime) / 1000).toFixed(2);
+        log(`✓ Model files loaded in ${elapsedTime}s`);
+
+        return {
+          modelType,
+          encoderBuffer,
+          decoderBuffer,
+          erbDecoderBuffer
+        };
+
+      } catch (err) {
+        log('✗ Model loading failed: ' + err.message);
+        throw err;
+      }
+    }
+
+    async function createSessionsForNumFrames(modelType, backendPreference, capabilities, numFrames, buffers) {
+      const startTime = performance.now();
+      const encoderSession = await createSessionWithBackend(
+        buffers.encoderBuffer, 'encoder', backendPreference, capabilities, numFrames
+      );
+      const decoderSession = await createSessionWithBackend(
+        buffers.decoderBuffer, 'decoder', backendPreference, capabilities, numFrames
+      );
+      const erbDecoderSession = await createSessionWithBackend(
+        buffers.erbDecoderBuffer, 'erb_decoder', backendPreference, capabilities, numFrames
+      );
+      const elapsedTime = ((performance.now() - startTime) / 1000).toFixed(2);
+      log(`✓ Sessions created for S=${numFrames} in ${elapsedTime}s`);
+      return {
+        modelType,
+        encoder: encoderSession,
+        decoder: decoderSession,
+        erb_decoder: erbDecoderSession,
+        numFrames
+      };
+    }
+
+    // ============================================================================
+    // BACKEND DETECTION
+    // ============================================================================
+
+    async function detectBackendCapabilities() {
+      log('Detecting backend capabilities...');
+      const capabilities = {
+        webnn_npu: false,
+        webnn_gpu: false,
+        webgpu: false,
+        wasm: true // Always available
+      };
+
+      // Check WebNN
+      if ('ml' in navigator) {
+        log('✓ WebNN API detected');
+
+        // Test NPU
+        try {
+          const npuContext = await navigator.ml.createContext({ deviceType: 'npu' });
+          if (npuContext) {
+            capabilities.webnn_npu = true;
+            log('✓ WebNN NPU available');
+          }
+        } catch (err) {
+          log('✗ WebNN NPU not available: ' + err.message);
+        }
+
+        // Test GPU
+        try {
+          const gpuContext = await navigator.ml.createContext({ deviceType: 'gpu' });
+          if (gpuContext) {
+            capabilities.webnn_gpu = true;
+            log('✓ WebNN GPU available');
+          }
+        } catch (err) {
+          log('✗ WebNN GPU not available: ' + err.message);
+        }
+      } else {
+        log('✗ WebNN API not available');
+      }
+
+      // Check WebGPU
+      if ('gpu' in navigator) {
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (adapter) {
+            capabilities.webgpu = true;
+            log('✓ WebGPU available');
+          }
+        } catch (err) {
+          log('✗ WebGPU not available: ' + err.message);
+        }
+      } else {
+        log('✗ WebGPU API not available');
+      }
+
+      return capabilities;
+    }
+
+    function updateBackendUI(capabilities) {
+      const selectEl = document.getElementById('backend-select');
+
+      if (capabilities.webnn_npu) {
+        selectEl.innerHTML += '<option value="npu">WebNN NPU</option>';
+      }
+      if (capabilities.webnn_gpu) {
+        selectEl.innerHTML += '<option value="gpu">WebNN GPU</option>';
+      }
+      if (capabilities.webgpu) {
+        selectEl.innerHTML += '<option value="webgpu">WebGPU</option>';
+      }
+
+      selectEl.innerHTML += '<option value="wasm">WASM (CPU)</option>';
+
+      // Enable controls
+      selectEl.disabled = false;
+      document.getElementById('load-model-btn').disabled = false;
+      document.getElementById('audio-input').disabled = true;
+
+      // Show warning if only WASM available
+      if (!capabilities.webnn_npu && !capabilities.webnn_gpu && !capabilities.webgpu) {
+        log('⚠️ Only CPU (WASM) backend available - processing will be slow');
+        showWarning(true);
+      }
+    }
+
+    // ============================================================================
+    // ONNX RUNTIME WEB LOADING
+    // ============================================================================
+
+    async function loadOnnxRuntime() {
+      log('Loading ONNX Runtime Web...');
+      try {
+        // Use ort.all bundle which includes WebNN, WebGPU and WASM EPs
+        const ortScript = document.createElement('script');
+        ortScript.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.25.1/dist/ort.all.min.js';
+        ortScript.type = 'text/javascript';
+
+        await new Promise((resolve, reject) => {
+          ortScript.onload = resolve;
+          ortScript.onerror = reject;
+          document.head.appendChild(ortScript);
+        });
+
+        log('✓ ONNX Runtime Web loaded (version 1.25.1 all-EPs bundle)');
+
+        // Configure WASM and point to CDN for worker/wasm assets
+        if (window.ort) {
+          window.ort.env.wasm.numThreads = 1;
+          window.ort.env.wasm.simd = true;
+          window.ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.25.1/dist/';
+          log('✓ WASM configuration: threads=1, simd=true, wasmPaths=CDN');
+        }
+
+        return true;
+      } catch (err) {
+        log('✗ Failed to load ONNX Runtime Web: ' + err.message);
+        return false;
+      }
+    }
+
+    // ============================================================================
+    // BACKEND SELECTION
+    // ============================================================================
+
+    function handleBackendChange(capabilities) {
+      const selectEl = document.getElementById('backend-select');
+      const selectedBackend = selectEl.value;
+
+      updateBackendBadge(selectedBackend);
+      log(`Backend selection changed: ${selectedBackend}`);
+
+      // Show warning if WASM manually selected
+      if (selectedBackend === 'wasm') {
+        showWarning(true);
+      } else {
+        // Check if selected backend is actually available
+        const backendAvailable =
+          (selectedBackend === 'auto') ||
+          (selectedBackend === 'npu' && capabilities.webnn_npu) ||
+          (selectedBackend === 'gpu' && capabilities.webnn_gpu) ||
+          (selectedBackend === 'webgpu' && capabilities.webgpu);
+
+        showWarning(!backendAvailable);
+      }
+      setModelStatus('Backend changed. Click Load Model.');
+      refreshProcessButtonState();
+    }
+
+    function applyBackendFromQuery(capabilities) {
+      const raw = new URLSearchParams(window.location.search).get('devicetype');
+      if (!raw) return;
+      const key = raw.toLowerCase();
+      const mapping = {
+        npu: 'npu',
+        gpu: 'gpu',
+        'webnn-npu': 'npu',
+        'webnn-gpu': 'gpu',
+        webgpu: 'webgpu',
+        wasm: 'wasm',
+        auto: 'auto'
+      };
+      const target = mapping[key];
+      if (!target) return;
+
+      const select = document.getElementById('backend-select');
+      const optionExists = Array.from(select.options).some(option => option.value === target);
+      if (!optionExists) {
+        log(`Requested backend from query is unavailable: ${target}`);
+        return;
+      }
+
+      select.value = target;
+      handleBackendChange(capabilities);
+      log(`Backend preselected from query: ${target}`);
+    }
+
+    // ============================================================================
+    // AUDIO INPUT HANDLING
+    // ============================================================================
+
+    let loadedAudioBuffer = null;
+    let loadedFileName = '';
+    let outputAudioUrl = null;
+
+    function formatBackendLabel(backend) {
+      const value = String(backend || '').toLowerCase();
+      if (value === 'auto') return 'Auto';
+      if (value === 'npu') return 'WebNN-NPU';
+      if (value === 'gpu') return 'WebNN-GPU';
+      if (value === 'webgpu') return 'WebGPU';
+      if (value === 'wasm') return 'WASM (CPU)';
+      return String(backend || 'Unknown');
+    }
+
+    function setModelStatus(message, isError = false) {
+      const modelStatus = document.getElementById('model-status');
+      modelStatus.textContent = message;
+      modelStatus.style.color = isError ? '#a94442' : '#666';
+    }
+
+    function getSelectedSessionKey() {
+      const modelType = document.getElementById('model-select').value;
+      const backendPreference = document.getElementById('backend-select').value;
+      const useVariant = (backendPreference === 'npu' || backendPreference === 'gpu') && modelType === 'df3';
+      return `${modelType}|${backendPreference}|${useVariant ? 'variant' : 'orig'}`;
+    }
+
+    function isSelectedModelLoaded() {
+      return !!modelBufferBundle && modelBufferKey === getSelectedSessionKey();
+    }
+
+    function refreshProcessButtonState() {
+      const processBtn = document.getElementById('process-btn');
+      if (!loadedAudioBuffer) {
+        processBtn.disabled = true;
+        processBtn.textContent = isSelectedModelLoaded() ? 'Load Audio First' : 'Load Model First';
+        return;
+      }
+
+      if (!isSelectedModelLoaded()) {
+        processBtn.disabled = true;
+        processBtn.textContent = 'Load Model First';
+        return;
+      }
+
+      processBtn.disabled = false;
+      processBtn.textContent = 'Process Audio';
+    }
+
+    async function handleLoadModel() {
+      const loadModelBtn = document.getElementById('load-model-btn');
+      loadModelBtn.disabled = true;
+      loadModelBtn.textContent = 'Loading Model...';
+      setModelStatus('Loading model files...');
+
+      try {
+        const modelType = document.getElementById('model-select').value;
+        const backendPreference = document.getElementById('backend-select').value;
+        const bufferKey = getSelectedSessionKey();
+
+        if (modelBufferBundle && modelBufferKey === bufferKey) {
+          log(`Model files already loaded for ${bufferKey}`);
+        } else {
+          if (modelBufferBundle) {
+            log(`Reloading model files: ${modelBufferKey} -> ${bufferKey}`);
+          }
+          modelBufferBundle = await loadModelBuffers(modelType, backendPreference);
+          modelBufferKey = bufferKey;
+          modelSessionCache.clear();
+          modelSessions = null;
+        }
+
+        document.getElementById('audio-input').disabled = false;
+        updateBackendBadge(backendPreference);
+        refreshProcessButtonState();
+        log('✓ Model files ready');
+        if (backendPreference === 'auto') {
+          setModelStatus('Model files loaded. Backend: Auto (resolved when processing starts).');
+        } else {
+          setModelStatus(`Model files loaded. Backend: ${formatBackendLabel(backendPreference)}.`);
+        }
+      } catch (err) {
+        log('✗ Model load failed: ' + err.message);
+        setModelStatus('Model load failed. Check log for details.', true);
+        alert('Model load failed: ' + err.message);
+      } finally {
+        loadModelBtn.disabled = false;
+        loadModelBtn.textContent = 'Load Model';
+      }
+    }
+
+    function getStereoChannels(audioBuffer) {
+      const left = audioBuffer.getChannelData(0);
+      const right = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : left;
+      return { left, right };
+    }
+
+    function drawWaveform(canvas, left, right, audio, state) {
+      const context = canvas.getContext('2d');
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      const pixelRatio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(width * pixelRatio));
+      canvas.height = Math.max(1, Math.floor(height * pixelRatio));
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, width, height);
+
+      const middle = height / 2;
+      const peakHeight = height * 0.42;
+      const color = canvas.dataset.color || '#3f6f9f';
+
+      context.fillStyle = '#f5f5f5';
+      context.fillRect(0, 0, width, height);
+      context.strokeStyle = '#d9d9d9';
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(0, middle + 0.5);
+      context.lineTo(width, middle + 0.5);
+      context.stroke();
+
+      context.strokeStyle = color;
+      context.globalAlpha = 0.8;
+      context.lineWidth = 1;
+      context.beginPath();
+      for (let x = 0; x < width; x++) {
+        const start = Math.floor(x * left.length / width);
+        const end = Math.max(start + 1, Math.floor((x + 1) * left.length / width));
+        let minimum = 1;
+        let maximum = -1;
+        for (let index = start; index < end && index < left.length; index++) {
+          const sample = ((left[index] || 0) + (right[index] || 0)) * 0.5;
+          minimum = Math.min(minimum, sample);
+          maximum = Math.max(maximum, sample);
+        }
+        context.moveTo(x + 0.5, middle + maximum * peakHeight);
+        context.lineTo(x + 0.5, middle + minimum * peakHeight);
+      }
+      context.stroke();
+      context.globalAlpha = 1;
+
+      if (audio.duration) {
+        const playheadX = Math.min(width, audio.currentTime / audio.duration * width);
+        context.fillStyle = '#333';
+        context.fillRect(Math.max(0, playheadX - 1), 0, 2, height);
+      }
+
+      state.draw = () => drawWaveform(canvas, left, right, audio, state);
+    }
+
+    function setupWaveform(canvas, left, right, audio, color = '#3f6f9f') {
+      canvas.dataset.color = color;
+      const state = { draw: null, animationFrame: null };
+      const resizeObserver = new ResizeObserver(() => state.draw());
+      resizeObserver.observe(canvas);
+      state.draw = () => drawWaveform(canvas, left, right, audio, state);
+
+      canvas.addEventListener('click', event => {
+        if (!audio.duration) return;
+        const bounds = canvas.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+        audio.currentTime = ratio * audio.duration;
+        state.draw();
+      });
+
+      canvas.addEventListener('pointermove', event => {
+        canvas.title = audio.duration
+          ? `${((event.clientX - canvas.getBoundingClientRect().left) / canvas.clientWidth * audio.duration).toFixed(1)}s`
+          : 'Waveform';
+      });
+
+      audio.addEventListener('play', () => {
+        const animate = () => {
+          state.draw();
+          if (!audio.paused) state.animationFrame = requestAnimationFrame(animate);
+        };
+        cancelAnimationFrame(state.animationFrame);
+        animate();
+      });
+      audio.addEventListener('pause', () => {
+        cancelAnimationFrame(state.animationFrame);
+        state.draw();
+      });
+      audio.addEventListener('ended', () => {
+        cancelAnimationFrame(state.animationFrame);
+        state.draw();
+      });
+
+      state.draw();
+    }
+
+    async function handleAudioInput(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      log(`Loading audio file: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
+      loadedFileName = file.name;
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        loadedAudioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+        const duration = loadedAudioBuffer.duration.toFixed(2);
+        const sampleRate = loadedAudioBuffer.sampleRate;
+        const channels = loadedAudioBuffer.numberOfChannels;
+
+        log(`✓ Audio loaded: ${duration}s, ${sampleRate}Hz, ${channels} channel(s)`);
+
+        // Show info
+        const infoEl = document.getElementById('input-info');
+        infoEl.textContent = `Duration: ${duration}s | Sample Rate: ${sampleRate}Hz | Channels: ${channels}`;
+        infoEl.classList.remove('hidden');
+
+        // Show audio player
+        const inputAudio = document.getElementById('input-audio');
+        inputAudio.src = URL.createObjectURL(file);
+        inputAudio.classList.remove('hidden');
+
+        // Show input waveform
+        const inputWaveform = document.getElementById('input-waveform');
+        const inputChannels = getStereoChannels(loadedAudioBuffer);
+        inputWaveform.classList.remove('hidden');
+        setupWaveform(inputWaveform, inputChannels.left, inputChannels.right, inputAudio, '#3f6f9f');
+
+        refreshProcessButtonState();
+
+      } catch (err) {
+        log('✗ Failed to load audio: ' + err.message);
+        alert('Failed to load audio file. Make sure it\'s a valid WAV file.');
+      }
+    }
+
+    // ============================================================================
+    // ATTENUATION SLIDER
+    // ============================================================================
+
+    function handleAttenuationChange(event) {
+      const value = event.target.value;
+      document.getElementById('attenuation-value').textContent = `${value} dB`;
+    }
+
+    function handleModelChange(event) {
+      const modelType = event.target.value;
+      const postfilterGroup = document.getElementById('postfilter-group');
+      postfilterGroup.style.display = modelType === 'df3' ? 'block' : 'none';
+      log(`Model selection changed: ${modelType.toUpperCase()}`);
+      setModelStatus('Model selection changed. Click Load Model.');
+      refreshProcessButtonState();
+    }
+
+    // ============================================================================
+    // PREPROCESSING PIPELINE
+    // ============================================================================
+
+    function preprocessChannel(channelData, fft, vorbisWindow, wnorm) {
+      const numFrames = Math.floor((channelData.length - FFT_SIZE) / FRAME_SIZE) + 1;
+
+      const erbNormState = new Float32Array(NB_ERB);
+      for (let i = 0; i < NB_ERB; i++) {
+        erbNormState[i] = -60.0 + (-90.0 - (-60.0)) * i / (NB_ERB - 1);
+      }
+      const unitNormState = new Float32Array(NB_DF);
+      for (let i = 0; i < NB_DF; i++) {
+        unitNormState[i] = 0.001 + (0.0001 - 0.001) * i / (NB_DF - 1);
+      }
+
+      const allErbFeatures = [];
+      const allSpecFeatures = [];
+      const allComplexSpec = [];
+      let analysisMem = new Float32Array(FFT_SIZE - FRAME_SIZE);
+
+      for (let frameIdx = 0; frameIdx < numFrames; frameIdx++) {
+        const frameStart = frameIdx * FRAME_SIZE;
+
+        const frame = new Float32Array(FRAME_SIZE);
+        for (let i = 0; i < FRAME_SIZE && frameStart + i < channelData.length; i++) {
+          frame[i] = channelData[frameStart + i];
+        }
+
+        const windowed = new Float32Array(FFT_SIZE);
+        windowed.set(analysisMem, 0);
+        windowed.set(frame, FFT_SIZE - FRAME_SIZE);
+
+        for (let i = 0; i < FFT_SIZE; i++) {
+          windowed[i] *= vorbisWindow[i];
+        }
+
+        const complexSpec = fft.forward(windowed);
+        for (let i = 0; i < NUM_FREQS; i++) {
+          complexSpec.real[i] *= wnorm;
+          complexSpec.imag[i] *= wnorm;
+        }
+
+        const magSquared = new Float32Array(NUM_FREQS);
+        for (let i = 0; i < NUM_FREQS; i++) {
+          magSquared[i] = complexSpec.real[i] * complexSpec.real[i] +
+                          complexSpec.imag[i] * complexSpec.imag[i];
+        }
+
+        const erbFeatLinear = applyErbFilterbank(magSquared);
+        const erbFeat = erbNormalizeDb(erbFeatLinear, erbNormState, 0.99);
+        allErbFeatures.push(erbFeat);
+
+        const specFeat = new Float32Array(NB_DF * 2);
+        for (let i = 0; i < NB_DF; i++) {
+          specFeat[i * 2] = complexSpec.real[i];
+          specFeat[i * 2 + 1] = complexSpec.imag[i];
+        }
+        const normalizedSpec = unitNormalize(specFeat, unitNormState, 0.99);
+        allSpecFeatures.push(normalizedSpec);
+
+        allComplexSpec.push({
+          real: complexSpec.real.slice(0, NUM_FREQS),
+          imag: complexSpec.imag.slice(0, NUM_FREQS)
+        });
+
+        analysisMem = frame;
+      }
+
+      return {
+        numFrames,
+        erbFeatures: allErbFeatures,
+        specFeatures: allSpecFeatures,
+        complexSpectra: allComplexSpec
+      };
+    }
+
+    async function preprocessAudio(audioBuffer) {
+      log('Starting preprocessing...');
+
+      const resampled = await resampleAudio(audioBuffer, SAMPLE_RATE);
+      const numChannels = resampled.numberOfChannels;
+      const length = resampled.length;
+
+      log(`Processing ${length} samples × ${numChannels} channel(s) (${(length / SAMPLE_RATE).toFixed(2)}s)`);
+
+      const vorbisWindow = createVorbisWindow(FFT_SIZE);
+      const fft = new FFT(FFT_SIZE);
+      const wnorm = 1.0 / ((FFT_SIZE * FFT_SIZE) / (2 * FRAME_SIZE));
+
+      const channels = [];
+      for (let ch = 0; ch < numChannels; ch++) {
+        const channelData = resampled.getChannelData(ch);
+        const processed = preprocessChannel(channelData, fft, vorbisWindow, wnorm);
+        channels.push(processed);
+      }
+
+      log(`✓ Preprocessing complete: ${channels[0].numFrames} frames × ${numChannels} ch`);
+
+      return {
+        numFrames: channels[0].numFrames,
+        numChannels,
+        channels,
+        originalSampleRate: audioBuffer.sampleRate
+      };
+    }
+
+    // ============================================================================
+    // TENSOR PACKING
+    // ============================================================================
+
+    function packTensorsForChannel(channelData) {
+      const { numFrames, erbFeatures, specFeatures } = channelData;
+
+      const erbTensorData = new Float32Array(1 * 1 * numFrames * NB_ERB);
+      for (let t = 0; t < numFrames; t++) {
+        for (let i = 0; i < NB_ERB; i++) {
+          erbTensorData[t * NB_ERB + i] = erbFeatures[t][i];
+        }
+      }
+
+      const specTensorData = new Float32Array(1 * 2 * numFrames * NB_DF);
+      for (let t = 0; t < numFrames; t++) {
+        for (let i = 0; i < NB_DF; i++) {
+          specTensorData[0 * numFrames * NB_DF + t * NB_DF + i] = specFeatures[t][i * 2];
+          specTensorData[1 * numFrames * NB_DF + t * NB_DF + i] = specFeatures[t][i * 2 + 1];
+        }
+      }
+
+      return {
+        feat_erb: new ort.Tensor('float32', erbTensorData, [1, 1, numFrames, NB_ERB]),
+        feat_spec: new ort.Tensor('float32', specTensorData, [1, 2, numFrames, NB_DF])
+      };
+    }
+
+    // ============================================================================
+    // INFERENCE PIPELINE
+    // ============================================================================
+
+    async function runInference(tensors) {
+      const startTime = performance.now();
+
+      try {
+        const t0 = performance.now();
+        const encoderOutputs = await modelSessions.encoder.session.run({
+          feat_erb: tensors.feat_erb,
+          feat_spec: tensors.feat_spec
+        });
+        const tEnc = performance.now() - t0;
+
+        const erbInputs = { emb: encoderOutputs.emb };
+        for (const name of ['e0', 'e1', 'e2', 'e3']) {
+          if (encoderOutputs[name]) erbInputs[name] = encoderOutputs[name];
+        }
+        const t1 = performance.now();
+        const erbDecoderOutputs = await modelSessions.erb_decoder.session.run(erbInputs);
+        const tErb = performance.now() - t1;
+
+        const dfInputs = { emb: encoderOutputs.emb };
+        for (const name of ['c0']) {
+          if (encoderOutputs[name]) dfInputs[name] = encoderOutputs[name];
+        }
+        const t2 = performance.now();
+        const dfDecoderOutputs = await modelSessions.decoder.session.run(dfInputs);
+        const tDf = performance.now() - t2;
+
+        const totalTime = ((performance.now() - startTime) / 1000).toFixed(3);
+        log(`  Inference: total=${totalTime}s (enc=${tEnc.toFixed(0)}ms, erb_dec=${tErb.toFixed(0)}ms, df_dec=${tDf.toFixed(0)}ms)`);
+        console.log(`[PERF] enc=${tEnc.toFixed(0)}ms erb_dec=${tErb.toFixed(0)}ms df_dec=${tDf.toFixed(0)}ms total=${totalTime}s`);
+
+        return {
+          encoder: encoderOutputs,
+          erb_mask: erbDecoderOutputs,
+          df_coefs: dfDecoderOutputs
+        };
+
+      } catch (err) {
+        log('✗ Inference failed: ' + err.message);
+        console.error('Inference error:', err);
+        throw err;
+      }
+    }
+
+    // ============================================================================
+    // ENHANCEMENT & SYNTHESIS
+    // ============================================================================
+
+    function interpolateErbMask(erbMask32, numFreqs) {
+      // Interpolate 32-band ERB mask to full spectrum (481 bins)
+      const mask = new Float32Array(numFreqs);
+      const scale = (NB_ERB - 1) / (numFreqs - 1);
+
+      for (let i = 0; i < numFreqs; i++) {
+        const erbIdx = i * scale;
+        const idx0 = Math.floor(erbIdx);
+        const idx1 = Math.min(idx0 + 1, NB_ERB - 1);
+        const frac = erbIdx - idx0;
+
+        mask[i] = erbMask32[idx0] * (1 - frac) + erbMask32[idx1] * frac;
+      }
+
+      return mask;
+    }
+
+    function applyDfFilter(maskedSpectra, coefs, frameIdx) {
+      // DF multi-frame filtering on MASKED spectra
+      // C++ einsum: "...tfn,...ntf->...tf"
+      // For each frame t, for each freq f:
+      //   out[t, f] = sum_{n=0..4} masked_spec[t-2+n, f] * coefs[n, t, f]
+
+      const TAPS = 5;
+      const LOOKAHEAD_OFFSET = 2;
+
+      const enhanced = {
+        real: new Float32Array(NUM_FREQS),
+        imag: new Float32Array(NUM_FREQS)
+      };
+
+      // Apply multi-frame filter to first 96 bins only
+      for (let f = 0; f < NB_DF; f++) {
+        let sumReal = 0;
+        let sumImag = 0;
+
+        for (let n = 0; n < TAPS; n++) {
+          const specFrameIdx = frameIdx - LOOKAHEAD_OFFSET + n;
+          if (specFrameIdx >= 0 && specFrameIdx < maskedSpectra.length) {
+            const specFrame = maskedSpectra[specFrameIdx];
+            const specReal = specFrame.real[f];
+            const specImag = specFrame.imag[f];
+            // Coef indexing: original [1,T,96,10] with last dim as [5,2] = (tap, complex)
+            // coefs.data[t * 96 * 10 + f * 10 + n * 2 + {0,1}]
+            const coefReal = coefs.data[frameIdx * NB_DF * 10 + f * 10 + n * 2];
+            const coefImag = coefs.data[frameIdx * NB_DF * 10 + f * 10 + n * 2 + 1];
+
+            // Standard complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+            sumReal += specReal * coefReal - specImag * coefImag;
+            sumImag += specReal * coefImag + specImag * coefReal;
+          }
+        }
+
+        enhanced.real[f] = sumReal;
+        enhanced.imag[f] = sumImag;
+      }
+
+      // Copy remaining bins (96..480) from masked spectrum
+      const currentMasked = maskedSpectra[frameIdx];
+      for (let f = NB_DF; f < NUM_FREQS; f++) {
+        enhanced.real[f] = currentMasked.real[f];
+        enhanced.imag[f] = currentMasked.imag[f];
+      }
+
+      return enhanced;
+    }
+
+    function applyPostFilter(originalSpec, enhancedSpec) {
+      // DF3 post-filter: boosts mask where enhanced magnitude is close to original
+      // C++: mask = |spec_e| / (|spec| + eps), then
+      //      mask_sin = mask * sin(pi*mask/2), pf = (1+beta) / (1 + beta*(mask/mask_sin)^2)
+      //      spec_e = spec_e * pf
+      const beta = 0.02;
+      const eps = 1e-12;
+
+      const result = {
+        real: new Float32Array(NUM_FREQS),
+        imag: new Float32Array(NUM_FREQS)
+      };
+
+      for (let i = 0; i < NUM_FREQS; i++) {
+        const originalMag = Math.sqrt(
+          originalSpec.real[i] * originalSpec.real[i] +
+          originalSpec.imag[i] * originalSpec.imag[i]
+        );
+        const enhancedMag = Math.sqrt(
+          enhancedSpec.real[i] * enhancedSpec.real[i] +
+          enhancedSpec.imag[i] * enhancedSpec.imag[i]
+        );
+
+        let mask = enhancedMag / (originalMag + eps);
+        mask = Math.max(eps, Math.min(1, mask));
+
+        const maskSin = Math.max(eps, mask * Math.sin(Math.PI * mask / 2));
+        const ratio = mask / maskSin;
+        const pf = (1 + beta) / (1 + beta * ratio * ratio);
+
+        result.real[i] = enhancedSpec.real[i] * pf;
+        result.imag[i] = enhancedSpec.imag[i] * pf;
+      }
+
+      return result;
+    }
+
+    function enhanceChannel(channelData, erbMaskTensor, dfCoefsTensor, fft, vorbisWindow, wnorm, modelType, enablePostFilter) {
+      const { numFrames, complexSpectra } = channelData;
+      const outputLength = numFrames * FRAME_SIZE;
+      const outputSignal = new Float32Array(outputLength);
+      const synthesisMem = new Float32Array(FFT_SIZE - FRAME_SIZE);
+      const isDf3 = modelType === 'df3';
+
+      // Apply ERB mask to all frames (used for bins 96+ in both DF2 and DF3)
+      const maskedSpectra = new Array(numFrames);
+      for (let frameIdx = 0; frameIdx < numFrames; frameIdx++) {
+        const erbMask32 = new Float32Array(NB_ERB);
+        for (let i = 0; i < NB_ERB; i++) {
+          const val = erbMaskTensor.data[frameIdx * NB_ERB + i];
+          erbMask32[i] = isFinite(val) ? Math.max(0, Math.min(1, val)) : 0.5;
+        }
+
+        const fullMask = expandErbMask(erbMask32);
+        const originalSpec = complexSpectra[frameIdx];
+        const maskedSpec = {
+          real: new Float32Array(NUM_FREQS),
+          imag: new Float32Array(NUM_FREQS)
+        };
+        for (let i = 0; i < NUM_FREQS; i++) {
+          maskedSpec.real[i] = originalSpec.real[i] * fullMask[i];
+          maskedSpec.imag[i] = originalSpec.imag[i] * fullMask[i];
+        }
+        maskedSpectra[frameIdx] = maskedSpec;
+      }
+
+      // Apply DF filter + synthesis
+      // DF2: DF filter runs on MASKED spec (bins 0-95), passes through rest
+      // DF3: DF filter runs on ORIGINAL spec (bins 0-95), replaces bins 96+ with masked
+      for (let frameIdx = 0; frameIdx < numFrames; frameIdx++) {
+        // DF filter input depends on model type
+        const dfInputSpectra = isDf3 ? complexSpectra : maskedSpectra;
+        let enhanced = applyDfFilter(dfInputSpectra, dfCoefsTensor, frameIdx);
+
+        // For DF3, overwrite bins 96+ with masked spec (DF filter only applied to first 96 bins)
+        if (isDf3) {
+          const currentMasked = maskedSpectra[frameIdx];
+          for (let i = NB_DF; i < NUM_FREQS; i++) {
+            enhanced.real[i] = currentMasked.real[i];
+            enhanced.imag[i] = currentMasked.imag[i];
+          }
+
+          // Optional post-filter
+          if (enablePostFilter) {
+            enhanced = applyPostFilter(complexSpectra[frameIdx], enhanced);
+          }
+        }
+
+        const enhancedReal = new Float32Array(FFT_SIZE);
+        const enhancedImag = new Float32Array(FFT_SIZE);
+
+        for (let i = 0; i < NUM_FREQS; i++) {
+          enhancedReal[i] = enhanced.real[i];
+          enhancedImag[i] = enhanced.imag[i];
+        }
+
+        for (let i = 1; i < NUM_FREQS - 1; i++) {
+          const mirrorIdx = FFT_SIZE - i;
+          enhancedReal[mirrorIdx] = enhancedReal[i];
+          enhancedImag[mirrorIdx] = -enhancedImag[i];
+        }
+
+        enhancedImag[0] = 0;
+        enhancedImag[NUM_FREQS - 1] = 0;
+
+        const timeFrame = fft.inverse(enhancedReal, enhancedImag);
+        for (let i = 0; i < FFT_SIZE; i++) {
+          timeFrame[i] *= FFT_SIZE * vorbisWindow[i];
+        }
+
+        const offset = frameIdx * FRAME_SIZE;
+        for (let i = 0; i < FRAME_SIZE; i++) {
+          if (offset + i < outputLength) {
+            outputSignal[offset + i] = timeFrame[i] + synthesisMem[i];
+          }
+        }
+        for (let i = 0; i < FFT_SIZE - FRAME_SIZE; i++) {
+          synthesisMem[i] = timeFrame[FRAME_SIZE + i];
+        }
+      }
+
+      return outputSignal;
+    }
+
+    async function createOutputAudio(channels48k, originalSampleRate) {
+      const numChannels = channels48k.length;
+      const signalLength = channels48k[0].length;
+
+      // Clean each channel
+      const cleanChannels = channels48k.map(signal => {
+        const clean = new Float32Array(signal.length);
+        for (let i = 0; i < signal.length; i++) {
+          const sample = signal[i];
+          clean[i] = isFinite(sample) ? Math.max(-1, Math.min(1, sample)) : 0;
+        }
+        return clean;
+      });
+
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const buffer48k = audioContext.createBuffer(numChannels, signalLength, SAMPLE_RATE);
+      for (let ch = 0; ch < numChannels; ch++) {
+        buffer48k.copyToChannel(cleanChannels[ch], ch);
+      }
+
+      if (originalSampleRate === SAMPLE_RATE) {
+        return buffer48k;
+      }
+
+      const targetLength = Math.ceil(buffer48k.duration * originalSampleRate);
+      const offlineContext = new OfflineAudioContext(numChannels, targetLength, originalSampleRate);
+      const source = offlineContext.createBufferSource();
+      source.buffer = buffer48k;
+      source.connect(offlineContext.destination);
+      source.start(0);
+
+      return await offlineContext.startRendering();
+    }
+
+    function encodeWav(audioBuffer) {
+      const numChannels = audioBuffer.numberOfChannels;
+      const sampleRate = audioBuffer.sampleRate;
+      const numFrames = audioBuffer.length;
+      const bytesPerSample = 2; // 16-bit PCM
+
+      const dataSize = numFrames * numChannels * bytesPerSample;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+
+      // WAV header
+      const writeString = (offset, string) => {
+        for (let i = 0; i < string.length; i++) {
+          view.setUint8(offset + i, string.charCodeAt(i));
+        }
+      };
+
+      writeString(0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeString(8, 'WAVE');
+      writeString(12, 'fmt ');
+      view.setUint32(16, 16, true); // fmt chunk size
+      view.setUint16(20, 1, true); // PCM
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+      view.setUint16(32, numChannels * bytesPerSample, true);
+      view.setUint16(34, bytesPerSample * 8, true);
+      writeString(36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      // PCM data
+      let offset = 44;
+      for (let i = 0; i < numFrames; i++) {
+        for (let ch = 0; ch < numChannels; ch++) {
+          const sample = audioBuffer.getChannelData(ch)[i];
+          const s = Math.max(-1, Math.min(1, sample));
+          view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+          offset += 2;
+        }
+      }
+
+      return buffer;
+    }
+
+    // ============================================================================
+    // PROCESS BUTTON HANDLER
+    // ============================================================================
+
+    function updateProgress(percent, label) {
+      const container = document.getElementById('progress-container');
+      const fill = document.getElementById('progress-fill');
+      container.classList.remove('hidden');
+      fill.style.width = `${percent}%`;
+      fill.textContent = label || `${Math.round(percent)}%`;
+    }
+
+    async function handleProcess() {
+      if (!isSelectedModelLoaded()) {
+        alert('Please load the model for the selected backend first');
+        return;
+      }
+
+      if (!loadedAudioBuffer) {
+        alert('Please load an audio file first');
+        return;
+      }
+
+      const processBtn = document.getElementById('process-btn');
+      processBtn.disabled = true;
+      const totalStartTime = performance.now();
+
+      try {
+        const backendPreference = document.getElementById('backend-select').value;
+        const modelType = document.getElementById('model-select').value;
+        const enablePostFilter = document.getElementById('postfilter-checkbox').checked;
+
+        updateProgress(5, 'Preprocessing audio...');
+        processBtn.textContent = 'Preprocessing Audio...';
+        const preprocessed = await preprocessAudio(loadedAudioBuffer);
+        const numFrames = preprocessed.numFrames;
+
+        updateProgress(10, 'Preparing model sessions...');
+        processBtn.textContent = 'Preparing Model...';
+
+        const sessionKey = `${getSelectedSessionKey()}|S=${numFrames}`;
+        if (modelSessionCache.has(sessionKey)) {
+          modelSessions = modelSessionCache.get(sessionKey);
+          log(`Reusing sessions for ${sessionKey}`);
+        } else {
+          log(`Creating sessions for ${sessionKey}`);
+          modelSessions = await createSessionsForNumFrames(
+            modelType,
+            backendPreference,
+            globalCapabilities,
+            numFrames,
+            modelBufferBundle
+          );
+          modelSessionCache.set(sessionKey, modelSessions);
+        }
+        updateBackendBadge(modelSessions.encoder.backend);
+        setModelStatus(`Model session ready on backend: ${modelSessions.encoder.backend}.`);
+
+        const { numChannels, channels } = preprocessed;
+
+        // Process each channel independently
+        const vorbisWindow = createVorbisWindow(FFT_SIZE);
+        const fft = new FFT(FFT_SIZE);
+        const wnorm = 1.0 / ((FFT_SIZE * FFT_SIZE) / (2 * FRAME_SIZE));
+
+        const enhancedChannels = [];
+
+        for (let ch = 0; ch < numChannels; ch++) {
+          const baseProgress = 30 + (ch * 60 / numChannels);
+          updateProgress(baseProgress, `Processing channel ${ch + 1}/${numChannels}...`);
+          processBtn.textContent = `Inference (ch ${ch + 1}/${numChannels})...`;
+
+          log(`Processing channel ${ch + 1}/${numChannels} (${modelType.toUpperCase()})...`);
+          const tensors = packTensorsForChannel(channels[ch]);
+          const inferenceOutputs = await runInference(tensors);
+
+          updateProgress(baseProgress + (30 / numChannels), `Synthesizing channel ${ch + 1}/${numChannels}...`);
+          processBtn.textContent = `Synthesis (ch ${ch + 1}/${numChannels})...`;
+
+          const enhanced = enhanceChannel(
+            channels[ch],
+            inferenceOutputs.erb_mask.m,
+            inferenceOutputs.df_coefs.coefs,
+            fft,
+            vorbisWindow,
+            wnorm,
+            modelType,
+            enablePostFilter
+          );
+          enhancedChannels.push(enhanced);
+        }
+
+        updateProgress(95, 'Creating output...');
+        processBtn.textContent = 'Creating Output...';
+
+        const outputBuffer = await createOutputAudio(enhancedChannels, preprocessed.originalSampleRate);
+
+        const wavBuffer = encodeWav(outputBuffer);
+        const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+
+        const outputAudio = document.getElementById('output-audio');
+        if (outputAudioUrl) {
+          URL.revokeObjectURL(outputAudioUrl);
+        }
+        outputAudioUrl = url;
+        outputAudio.src = url;
+        outputAudio.classList.remove('hidden');
+
+        const outputWaveform = document.getElementById('output-waveform');
+        const outputChannels = getStereoChannels(outputBuffer);
+        outputWaveform.classList.remove('hidden');
+        setupWaveform(outputWaveform, outputChannels.left, outputChannels.right, outputAudio, '#2f8f6f');
+
+        const downloadBtn = document.getElementById('download-btn');
+        downloadBtn.onclick = () => {
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = loadedFileName.replace('.wav', '_denoised.wav');
+          a.click();
+        };
+        downloadBtn.classList.remove('hidden');
+
+        const totalTime = ((performance.now() - totalStartTime) / 1000).toFixed(2);
+        const audioDuration = loadedAudioBuffer.duration;
+        const realtimeRatio = (audioDuration / parseFloat(totalTime)).toFixed(1);
+
+        updateProgress(100, `Done in ${totalTime}s (${realtimeRatio}× realtime)`);
+        processBtn.textContent = 'Process Audio';
+        log(`✓ Total: ${totalTime}s for ${audioDuration.toFixed(1)}s audio (${realtimeRatio}× realtime)`);
+
+      } catch (err) {
+        log('✗ Processing failed: ' + err.message);
+        console.error(err);
+        alert('Processing failed: ' + err.message);
+        processBtn.textContent = 'Process Audio';
+        updateProgress(0, '');
+        document.getElementById('progress-container').classList.add('hidden');
+      } finally {
+        processBtn.disabled = false;
+      }
+    }
+
+    // ============================================================================
+    // WASM vs WebNN CORRECTNESS DIFF
+    // ============================================================================
+
+    function tensorStats(tensor) {
+      const data = tensor.data;
+      let min = Infinity, max = -Infinity, sumAbs = 0, nNaN = 0, nInf = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        if (Number.isNaN(v)) { nNaN++; continue; }
+        if (!Number.isFinite(v)) { nInf++; continue; }
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sumAbs += Math.abs(v);
+      }
+      const mean = sumAbs / data.length;
+      return { shape: tensor.dims, n: data.length, min, max, meanAbs: mean, nNaN, nInf };
+    }
+
+    function tensorDiff(a, b) {
+      if (a.dims.length !== b.dims.length || a.dims.some((d, i) => d !== b.dims[i])) {
+        return { shapeMismatch: true, aDims: a.dims, bDims: b.dims };
+      }
+      const ad = a.data, bd = b.data;
+      let maxAbs = 0, sumSqDiff = 0, sumSqA = 0, argmaxIdx = -1;
+      let nFiniteMismatch = 0;
+      for (let i = 0; i < ad.length; i++) {
+        const va = ad[i], vb = bd[i];
+        if (!Number.isFinite(va) || !Number.isFinite(vb)) {
+          if (Number.isFinite(va) !== Number.isFinite(vb)) nFiniteMismatch++;
+          continue;
+        }
+        const d = Math.abs(va - vb);
+        if (d > maxAbs) { maxAbs = d; argmaxIdx = i; }
+        sumSqDiff += d * d;
+        sumSqA += va * va;
+      }
+      const rmsDiff = Math.sqrt(sumSqDiff / ad.length);
+      const relRms = Math.sqrt(sumSqDiff / Math.max(sumSqA, 1e-12));
+      return { shapeMismatch: false, maxAbs, rmsDiff, relRms, argmaxIdx, nFiniteMismatch };
+    }
+
+    async function createSessionForDiff(buffer, modelName, backendPref, numFrames) {
+      const cascade = backendPref === 'wasm' ? [{ name: 'wasm' }]
+                    : backendPref === 'npu'  ? [{ name: 'webnn', deviceType: 'npu' }]
+                    : backendPref === 'gpu'  ? [{ name: 'webnn', deviceType: 'gpu' }]
+                    : backendPref === 'webgpu' ? [{ name: 'webgpu' }]
+                    : [{ name: 'wasm' }];
+      const backend = cascade[0];
+      const isWebnn = backend.name === 'webnn';
+      const options = {
+        executionProviders: [],
+        logSeverityLevel: isWebnn ? 0 : 3,
+        logVerbosityLevel: isWebnn ? 1 : 0,
+        ...(numFrames && isWebnn ? { freeDimensionOverrides: { S: numFrames } } : {})
+      };
+      if (isWebnn) {
+        const ctx = await navigator.ml.createContext({ deviceType: backend.deviceType });
+        options.executionProviders = [{ name: 'webnn', deviceType: backend.deviceType, context: ctx }];
+      } else {
+        options.executionProviders = [{ name: backend.name }];
+      }
+      return await ort.InferenceSession.create(buffer, options);
+    }
+
+    async function runFullInference(sessions, tensors, label) {
+      const tag = label ? `[${label}] ` : '';
+      let encOut, erbOut, dfOut;
+      try {
+        log(`${tag}running encoder...`);
+        encOut = await sessions.encoder.run({
+          feat_erb: tensors.feat_erb,
+          feat_spec: tensors.feat_spec
+        });
+      } catch (err) {
+        throw new Error(`${tag}encoder run failed: ${err.message}`);
+      }
+      try {
+        log(`${tag}running erb_decoder...`);
+        const erbIn = { emb: encOut.emb };
+        for (const n of ['e0', 'e1', 'e2', 'e3']) if (encOut[n]) erbIn[n] = encOut[n];
+        erbOut = await sessions.erb_decoder.run(erbIn);
+      } catch (err) {
+        throw new Error(`${tag}erb_decoder run failed: ${err.message}`);
+      }
+      try {
+        log(`${tag}running df_decoder...`);
+        const dfIn = { emb: encOut.emb };
+        if (encOut.c0) dfIn.c0 = encOut.c0;
+        dfOut = await sessions.decoder.run(dfIn);
+      } catch (err) {
+        throw new Error(`${tag}df_decoder run failed: ${err.message}`);
+      }
+      return { enc: encOut, erb: erbOut, df: dfOut };
+    }
+
+    async function handleDiff() {
+      if (!loadedAudioBuffer) { alert('Please load an audio file first'); return; }
+      const diffBtn = document.getElementById('diff-btn');
+      diffBtn.disabled = true;
+      diffBtn.textContent = 'Diffing...';
+      try {
+        const modelType = document.getElementById('model-select').value;
+        const webnnChoice = document.getElementById('backend-select').value;
+        const webnnBackend = (webnnChoice === 'wasm' || webnnChoice === 'auto') ? 'gpu' : webnnChoice;
+        log(`\n[DIFF] Comparing WASM vs webnn-${webnnBackend} (${modelType.toUpperCase()})`);
+
+        const pre = await preprocessAudio(loadedAudioBuffer);
+        const numFrames = pre.numFrames;
+        const ch = pre.channels[0];
+        const tensorsA = packTensorsForChannel(ch);
+        const tensorsB = packTensorsForChannel(ch);
+        log(`[DIFF] numFrames=${numFrames}, input stats feat_erb: ${JSON.stringify(tensorStats(tensorsA.feat_erb))}`);
+        log(`[DIFF] input stats feat_spec: ${JSON.stringify(tensorStats(tensorsA.feat_spec))}`);
+
+        const cfg = MODEL_CONFIGS[modelType];
+        const useVariant = modelType === 'df3';
+        const [encBuf, decBuf, erbBuf] = await Promise.all([
+          loadModel(`${modelType}-encoder`, cfg.urls.encoder, cfg.opfsPaths.encoder),
+          loadModel(`${modelType}-decoder`, cfg.urls.decoder, cfg.opfsPaths.decoder),
+          loadModel(`${modelType}-erb_decoder`, cfg.urls.erb_decoder, cfg.opfsPaths.erb_decoder)
+        ]);
+        let encBufWebnn = encBuf, decBufWebnn = decBuf, erbBufWebnn = erbBuf;
+        if (useVariant) {
+          log(`[DIFF] Loading *.webnn.onnx variants (GRU rewrite) for WebNN side`);
+          const fetchVariant = async (url) => {
+            const res = await fetch(url, { cache: 'no-store' });
+            if (!res.ok) throw new Error(`variant ${url}: ${res.status}`);
+            return await res.arrayBuffer();
+          };
+          [encBufWebnn, decBufWebnn, erbBufWebnn] = await Promise.all([
+            fetchVariant(cfg.urls.encoder.replace('.onnx', '.webnn.onnx')),
+            fetchVariant(cfg.urls.decoder.replace('.onnx', '.webnn.onnx')),
+            fetchVariant(cfg.urls.erb_decoder.replace('.onnx', '.webnn.onnx'))
+          ]);
+        }
+
+        log(`[DIFF] Creating WASM sessions (originals)...`);
+        const wasmSessions = {
+          encoder: await createSessionForDiff(encBuf, 'encoder', 'wasm', numFrames),
+          decoder: await createSessionForDiff(decBuf, 'decoder', 'wasm', numFrames),
+          erb_decoder: await createSessionForDiff(erbBuf, 'erb_decoder', 'wasm', numFrames)
+        };
+        log(`[DIFF] Creating webnn-${webnnBackend} sessions${useVariant ? ' (rewritten)' : ''}...`);
+        const webnnSessions = {
+          encoder: await createSessionForDiff(encBufWebnn, 'encoder', webnnBackend, numFrames),
+          decoder: await createSessionForDiff(decBufWebnn, 'decoder', webnnBackend, numFrames),
+          erb_decoder: await createSessionForDiff(erbBufWebnn, 'erb_decoder', webnnBackend, numFrames)
+        };
+
+        log(`[DIFF] Running WASM inference...`);
+        const outA = await runFullInference(wasmSessions, tensorsA, 'WASM');
+        log(`[DIFF] Running WebNN inference...`);
+        const outB = await runFullInference(webnnSessions, tensorsB, 'WEBNN');
+
+        const compareGroup = (groupName, a, b) => {
+          log(`\n[DIFF] === ${groupName} outputs ===`);
+          const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+          for (const key of keys) {
+            if (!a[key] || !b[key]) {
+              log(`  [${key}] missing: wasm=${!!a[key]} webnn=${!!b[key]}`);
+              continue;
+            }
+            const sA = tensorStats(a[key]);
+            const sB = tensorStats(b[key]);
+            const d = tensorDiff(a[key], b[key]);
+            if (d.shapeMismatch) {
+              log(`  [${key}] SHAPE MISMATCH wasm=${JSON.stringify(d.aDims)} webnn=${JSON.stringify(d.bDims)}`);
+              continue;
+            }
+            const verdict = d.maxAbs > 0.1 ? '!!! DIVERGENT !!!'
+                          : d.maxAbs > 0.01 ? '  suspicious'
+                          : d.maxAbs > 0.0001 ? '  tiny'
+                          : '  OK';
+            log(`  [${key}] shape=${JSON.stringify(sA.shape)} ${verdict}`);
+            log(`     WASM: min=${sA.min.toExponential(2)} max=${sA.max.toExponential(2)} meanAbs=${sA.meanAbs.toExponential(2)} nan=${sA.nNaN} inf=${sA.nInf}`);
+            log(`     WEBNN: min=${sB.min.toExponential(2)} max=${sB.max.toExponential(2)} meanAbs=${sB.meanAbs.toExponential(2)} nan=${sB.nNaN} inf=${sB.nInf}`);
+            log(`     diff: maxAbs=${d.maxAbs.toExponential(3)} rms=${d.rmsDiff.toExponential(3)} relRms=${d.relRms.toExponential(3)} argmax@${d.argmaxIdx} finiteMismatch=${d.nFiniteMismatch}`);
+          }
+        };
+
+        compareGroup('encoder', outA.enc, outB.enc);
+        compareGroup('erb_decoder', outA.erb, outB.erb);
+        compareGroup('df_decoder', outA.df, outB.df);
+
+        log(`\n[DIFF] Summary: tensors marked "DIVERGENT" are where WebNN output disagrees with WASM ground truth.`);
+        log(`[DIFF] Done.`);
+      } catch (err) {
+        log('[DIFF] FAILED: ' + err.message);
+        console.error('[DIFF] error', err);
+      } finally {
+        diffBtn.disabled = false;
+        diffBtn.textContent = 'Diff WASM vs WebNN';
+      }
+    }
+
+    // ============================================================================
+    // INITIALIZATION
+    // ============================================================================
+
+    let globalCapabilities = null;
+
+    async function initialize() {
+      log('Starting initialization...');
+
+      // Load ONNX Runtime
+      const ortLoaded = await loadOnnxRuntime();
+      if (!ortLoaded) {
+        log('✗ Cannot proceed without ONNX Runtime');
+        return;
+      }
+
+      // Detect backends
+      globalCapabilities = await detectBackendCapabilities();
+      updateBackendUI(globalCapabilities);
+      applyBackendFromQuery(globalCapabilities);
+      updateBackendBadge(document.getElementById('backend-select').value);
+
+      // Set up event listeners
+      document.getElementById('backend-select').addEventListener('change', () => handleBackendChange(globalCapabilities));
+      document.getElementById('load-model-btn').addEventListener('click', handleLoadModel);
+      document.getElementById('audio-input').addEventListener('change', handleAudioInput);
+      document.getElementById('attenuation-slider').addEventListener('input', handleAttenuationChange);
+      document.getElementById('process-btn').addEventListener('click', handleProcess);
+      document.getElementById('model-select').addEventListener('change', handleModelChange);
+
+      refreshProcessButtonState();
+
+      log('✓ Initialization complete - ready to load audio');
+    }
+
+    // Start
+    initialize();
+  </script>
+</body>
+</html>
