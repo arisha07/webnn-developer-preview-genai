@@ -1,12 +1,17 @@
 /* eslint-disable no-undef, no-unused-vars, no-empty */
 import { $, setupORT, showCompatibleChromiumVersion, getWebnnStatus } from "../../assets/js/common_utils.js";
 
+const HF_MODEL_BASE = "https://huggingface.co/webnn/stem-separator/resolve/main/onnx";
+const isRemote = location.href.includes("github.io");
+
 const MODELS = {
     htdemucs_fwd: {
         label: "htdemucs_fwd (our export, Path A)",
-        url: "./models/htdemucs_fwd/htdemucs_fwd.onnx",
+        url: isRemote ? `${HF_MODEL_BASE}/htdemucs_fwd.onnx` : "./models/htdemucs_fwd/htdemucs_fwd.onnx",
         opfsPath: "models/htdemucs_fwd/htdemucs_fwd.onnx",
-        externalDataUrl: "./models/htdemucs_fwd/htdemucs_fwd.onnx.data",
+        externalDataUrl: isRemote
+            ? `${HF_MODEL_BASE}/htdemucs_fwd.onnx.data`
+            : "./models/htdemucs_fwd/htdemucs_fwd.onnx.data",
         externalDataOpfsPath: "models/htdemucs_fwd/htdemucs_fwd.onnx.data",
         sizeMB: 170,
         fwdOnly: true,
