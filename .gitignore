@@ -8,6 +8,7 @@
 .shared
 .github
 demos/z-image-turbo/models/onnx/*
+hf_upload/
 
 # User-specific files
 *.rsuser
