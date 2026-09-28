@@ -1,1507 +1,86 @@
-/* eslint-disable no-undef, no-unused-vars, no-empty */
-import { $, setupORT, showCompatibleChromiumVersion, getWebnnStatus } from "../../assets/js/common_utils.js";
+/* global ort */
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+//
+// An example how to run HTDemucs stem separation with WebNN in onnxruntime-web.
+//
 
-const HF_MODEL_BASE = "https://huggingface.co/webnn/stem-separator/resolve/main/onnx";
-const isRemote = location.href.includes("github.io");
+import {
+    $,
+    log,
+    logError,
+    setupORT,
+    showCompatibleChromiumVersion,
+    getWebnnStatus,
+    getQueryValue,
+    checkRemoteEnvironment,
+    getHuggingFaceDomain,
+} from "../../assets/js/common_utils.js";
+import { WebNNPerf } from "../webnn-perf.js";
+import {
+    HOP,
+    SAMPLE_RATE,
+    SEGMENT_LENGTH,
+    SPECTROGRAM_SHAPE,
+    STEM_NAMES,
+    WAVEFORM_SHAPE,
+    addSegmentToStems,
+    buildOverlapWeights,
+    computeMixError,
+    createStemBuffers,
+    extractSegment,
+    finalizeStemRange,
+    getSegmentLayout,
+    htdemucsPostForward,
+    htdemucsPreForward,
+} from "./htdemucs.js";
+import {
+    STREAM_LEAD_HOPS,
+    mixerPause,
+    publishStemRegion,
+    resetStemMixer,
+    startStemMixer,
+    stemMixer,
+    stemTransport,
+    toggleStemMute,
+    toggleStemSolo,
+    updateStemTileStates,
+    updateTransportUi,
+} from "./stem_mixer.js";
+import {
+    computeLevels,
+    decodeAudioFile,
+    downloadWithProgress,
+    encodeWavFloat32,
+    readFromOPFS,
+    resampleAudioBuffer,
+    stripExtension,
+    toMegabytes,
+    toStereo,
+    triggerDownload,
+    writeToOPFS,
+} from "./utils.js";
+import { setupWaveform } from "./waveform.js";
 
-const MODELS = {
-    htdemucs_fwd: {
-        label: "htdemucs_fwd (our export, Path A)",
-        url: isRemote ? `${HF_MODEL_BASE}/htdemucs_fwd.onnx` : "./models/htdemucs_fwd/htdemucs_fwd.onnx",
-        opfsPath: "models/htdemucs_fwd/htdemucs_fwd.onnx",
-        externalDataUrl: isRemote
-            ? `${HF_MODEL_BASE}/htdemucs_fwd.onnx.data`
-            : "./models/htdemucs_fwd/htdemucs_fwd.onnx.data",
-        externalDataOpfsPath: "models/htdemucs_fwd/htdemucs_fwd.onnx.data",
-        sizeMB: 170,
-        fwdOnly: true,
-        inputNames: ["x", "xt"],
-        outputNames: ["x_out", "xt_out"],
-    },
+const MODEL = {
+    name: "htdemucs_fwd",
+    host: checkRemoteEnvironment() ? "https://huggingface.co/webnn/stem-separator/resolve/main/onnx" : "./models",
+    file: "htdemucs_fwd.onnx",
+    externalData: "htdemucs_fwd.onnx.data",
+    size: "170MB",
 };
 
-function updateBackendBadge(backend) {
-    const badge = document.getElementById("badge");
-    const device = document.getElementById("device");
-    const normalized = String(backend || "").toLowerCase();
-    const label = normalized.includes("npu")
-        ? "NPU"
-        : normalized.includes("gpu") || normalized === "auto"
-          ? "GPU"
-          : "CPU";
-    device.textContent = label;
-    badge.className = label === "NPU" ? "npu" : label === "CPU" ? "cpu" : "";
-}
-
-const statusEl = document.getElementById("status");
-const loadBtn = document.getElementById("load-btn");
-const progressContainer = document.getElementById("progress-container");
-const progressFill = document.getElementById("progress-fill");
-const inferenceControlState = new Map();
-
-function setInferenceControlsDisabled(disabled) {
-    const controls = [
-        document.getElementById("model-select"),
-        document.getElementById("backend-select"),
-        document.getElementById("load-btn"),
-        document.getElementById("audio-file"),
-    ];
-
-    if (disabled) {
-        controls.forEach(control => {
-            inferenceControlState.set(control, control.disabled);
-            control.disabled = true;
-        });
-        return;
-    }
-
-    inferenceControlState.forEach((wasDisabled, control) => {
-        control.disabled = wasDisabled;
-    });
-    inferenceControlState.clear();
-}
-
-function log(message) {
-    console.log(message);
-}
-
-function setProgress(percent, label) {
-    progressContainer.style.display = "block";
-    progressFill.style.width = `${percent}%`;
-    progressFill.textContent = label || `${Math.round(percent)}%`;
-}
-
-function hideProgress() {
-    progressContainer.style.display = "none";
-}
-
-// ============================================================================
-// OPFS caching
-// ============================================================================
-
-async function readFromOPFS(path) {
-    try {
-        const root = await navigator.storage.getDirectory();
-        const parts = path.split("/").filter(p => p);
-        let current = root;
-        for (let i = 0; i < parts.length - 1; i++) {
-            current = await current.getDirectoryHandle(parts[i]);
-        }
-        const fileHandle = await current.getFileHandle(parts[parts.length - 1]);
-        const file = await fileHandle.getFile();
-        return await file.arrayBuffer();
-    } catch {
-        return null;
-    }
-}
-
-async function writeToOPFS(path, arrayBuffer) {
-    try {
-        const root = await navigator.storage.getDirectory();
-        const parts = path.split("/").filter(p => p);
-        let current = root;
-        for (let i = 0; i < parts.length - 1; i++) {
-            current = await current.getDirectoryHandle(parts[i], { create: true });
-        }
-        const fileHandle = await current.getFileHandle(parts[parts.length - 1], { create: true });
-        const writable = await fileHandle.createWritable();
-        await writable.write(arrayBuffer);
-        await writable.close();
-        return true;
-    } catch (err) {
-        log("OPFS write failed: " + err.message);
-        return false;
-    }
-}
-
-// ============================================================================
-// Load ONNX Runtime Web
-// ============================================================================
-
-async function loadOrt() {
-    if (window.ort) {
-        return;
-    }
-    log("Loading ONNX Runtime Web...");
-    await setupORT("stem-separator", "dev");
-    window.ort.env.wasm.numThreads = 1;
-    window.ort.env.wasm.simd = true;
-    log("✓ ONNX Runtime Web loaded (webgpu build)");
-}
-
-async function updateWebnnStatus() {
-    const status = $("#webnnstatus");
-    const info = $("#info");
-    const links = ' · <a href="?devicetype=gpu">GPU</a> · <a href="?devicetype=npu">NPU</a>';
-    const status_ = await getWebnnStatus();
-    if (status_.webnn) {
-        status.className = "green";
-        info.innerHTML = "WebNN supported" + links;
-    } else {
-        status.className = "red";
-        info.innerHTML = (status_.error ? `WebNN not supported: ${status_.error}` : "WebNN not supported") + links;
-    }
-}
-
-// ============================================================================
-// Download model with progress
-// ============================================================================
-
-async function downloadWithProgress(url) {
-    log(`Downloading from ${url}...`);
-    const response = await fetch(url);
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const contentLength = response.headers.get("content-length");
-    const total = contentLength ? parseInt(contentLength, 10) : 0;
-    let received = 0;
-    const chunks = [];
-    const reader = response.body.getReader();
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-        if (total) {
-            const pct = (received / total) * 100;
-            setProgress(pct, `${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`);
-        }
-    }
-
-    const buffer = new Uint8Array(received);
-    let offset = 0;
-    for (const chunk of chunks) {
-        buffer.set(chunk, offset);
-        offset += chunk.length;
-    }
-
-    log(`✓ Downloaded ${(received / 1048576).toFixed(1)} MB`);
-    return buffer.buffer;
-}
-
-async function loadOneFile(label, opfsPath, url) {
-    log(`Checking OPFS cache for ${label}...`);
-    let buffer = await readFromOPFS(opfsPath);
-    if (buffer) {
-        log(`✓ ${label} loaded from cache (${(buffer.byteLength / 1048576).toFixed(1)} MB)`);
-        return buffer;
-    }
-    log(`Cache miss for ${label}, fetching from disk...`);
-    buffer = await downloadWithProgress(url);
-    log(`Caching ${label} to OPFS...`);
-    const cached = await writeToOPFS(opfsPath, buffer);
-    if (cached) log(`✓ ${label} cached to OPFS`);
-    return buffer;
-}
-
-async function loadModelBuffer(modelConfig) {
-    const mainBuffer = await loadOneFile(modelConfig.label, modelConfig.opfsPath, modelConfig.url);
-    let externalBuffer = null;
-    if (modelConfig.externalDataUrl) {
-        externalBuffer = await loadOneFile(
-            modelConfig.label + " (weights)",
-            modelConfig.externalDataOpfsPath,
-            modelConfig.externalDataUrl,
-        );
-    }
-    return { mainBuffer, externalBuffer };
-}
-
-// ============================================================================
-// Backend cascade with explicit try/catch per backend
-// ============================================================================
-
-async function detectCapabilities() {
-    const caps = { webnn_npu: false, webnn_gpu: false, webgpu: false };
-
-    if ("ml" in navigator) {
-        try {
-            await navigator.ml.createContext({ deviceType: "npu" });
-            caps.webnn_npu = true;
-        } catch {}
-        try {
-            await navigator.ml.createContext({ deviceType: "gpu" });
-            caps.webnn_gpu = true;
-        } catch {}
-    }
-
-    if ("gpu" in navigator) {
-        try {
-            const adapter = await navigator.gpu.requestAdapter();
-            if (adapter) caps.webgpu = true;
-        } catch {}
-    }
-
-    return caps;
-}
-
-async function createSessionWithCascade(modelBuffers, caps, selection, modelConfig) {
-    const all = [
-        { id: "webnn-npu", name: "webnn", deviceType: "npu", label: "WebNN-NPU", available: caps.webnn_npu },
-        { id: "webnn-gpu", name: "webnn", deviceType: "gpu", label: "WebNN-GPU", available: caps.webnn_gpu },
-        { id: "webgpu", name: "webgpu", label: "WebGPU", available: caps.webgpu },
-        { id: "wasm", name: "wasm", label: "WASM", available: true },
-    ];
-    const backends = selection === "auto" ? all : all.filter(backend => backend.id === selection);
-    if (backends.length === 0) {
-        throw new Error(`Backend "${selection}" not found`);
-    }
-    if (selection !== "auto") {
-        log(`Backend forced to ${backends[0].label} (no fallback).`);
-    }
-
-    const { mainBuffer, externalBuffer } = modelBuffers;
-    const externalDataArg = externalBuffer
-        ? [
-              {
-                  data: externalBuffer,
-                  path: (modelConfig?.externalDataUrl || "").split("/").pop() || "htdemucs_fwd.onnx.data",
-              },
-          ]
-        : undefined;
-
-    for (const backend of backends) {
-        if (!backend.available) {
-            log(`  ${backend.label}: unavailable`);
-            continue;
-        }
-
-        try {
-            log(`Trying ${backend.label}...`);
-            const sessionOptions = {
-                executionProviders: [],
-                logSeverityLevel: 3,
-            };
-            if (externalDataArg) {
-                sessionOptions.externalData = externalDataArg;
-            }
-
-            if (backend.name === "webnn") {
-                const mlContext = await navigator.ml.createContext({ deviceType: backend.deviceType });
-                sessionOptions.executionProviders.push({
-                    name: "webnn",
-                    deviceType: backend.deviceType,
-                    context: mlContext,
-                });
-            } else {
-                sessionOptions.executionProviders.push({ name: backend.name });
-            }
-
-            const session = await ort.InferenceSession.create(mainBuffer, sessionOptions);
-            log(`✓ Session created with ${backend.label}`);
-            return { session, backendLabel: backend.label };
-        } catch (err) {
-            log(`✗ ${backend.label} failed: ${err.message}`);
-            continue;
-        }
-    }
-
-    throw new Error("All backends failed");
-}
-
-// ============================================================================
-// Inspect tensors
-// ============================================================================
-
-// Parse ONNX model protobuf to extract input/output shapes
-// ONNX uses protobuf format; we only need to decode a subset
-function parseOnnxIoShapes(modelBuffer) {
-    // Lightweight protobuf varint decoder
-    const bytes = new Uint8Array(modelBuffer);
-
-    function readVarint(offset) {
-        let result = 0n;
-        let shift = 0n;
-        let consumed = 0;
-        while (offset + consumed < bytes.length) {
-            const byte = bytes[offset + consumed];
-            result |= BigInt(byte & 0x7f) << shift;
-            consumed++;
-            if ((byte & 0x80) === 0) break;
-            shift += 7n;
-        }
-        return { value: result, consumed };
-    }
-
-    function readTag(offset) {
-        const v = readVarint(offset);
-        const tag = Number(v.value >> 3n);
-        const wireType = Number(v.value & 0x7n);
-        return { tag, wireType, consumed: v.consumed };
-    }
-
-    function readLengthDelimited(offset) {
-        const len = readVarint(offset);
-        const dataStart = offset + len.consumed;
-        const dataLen = Number(len.value);
-        return { data: bytes.subarray(dataStart, dataStart + dataLen), totalConsumed: len.consumed + dataLen };
-    }
-
-    function readString(data) {
-        return new TextDecoder().decode(data);
-    }
-
-    // TypeProto -> tensor_type field number 1
-    // Tensor -> elem_type (int32, tag 1), shape (tag 2, TensorShapeProto)
-    // TensorShapeProto -> dim (tag 1, repeated Dimension)
-    // Dimension -> dim_value (int64, tag 1) | dim_param (string, tag 2)
-
-    const ONNX_DTYPES = {
-        1: "float32",
-        2: "uint8",
-        3: "int8",
-        4: "uint16",
-        5: "int16",
-        6: "int32",
-        7: "int64",
-        8: "string",
-        9: "bool",
-        10: "float16",
-        11: "float64",
-        12: "uint32",
-        13: "uint64",
-        14: "complex64",
-        15: "complex128",
-        16: "bfloat16",
-    };
-
-    function parseTensorShape(data) {
-        // data is TensorShapeProto
-        const dims = [];
-        let offset = 0;
-        while (offset < data.length) {
-            const { tag, wireType, consumed } = readTag(offset);
-            offset += consumed;
-            if (tag === 1 && wireType === 2) {
-                // dim (repeated Dimension)
-                const dim = readLengthDelimited(offset);
-                offset += dim.totalConsumed;
-                // Parse Dimension
-                let dOffset = 0;
-                const dData = dim.data;
-                let dimValue = null;
-                let dimParam = null;
-                while (dOffset < dData.length) {
-                    const { tag: dTag, wireType: dWire, consumed: dC } = readTag(dOffset);
-                    dOffset += dC;
-                    if (dTag === 1 && dWire === 0) {
-                        const v = readVarint(dOffset);
-                        dimValue = Number(v.value);
-                        dOffset += v.consumed;
-                    } else if (dTag === 2 && dWire === 2) {
-                        const s = readLengthDelimited(dOffset);
-                        dimParam = readString(s.data);
-                        dOffset += s.totalConsumed;
-                    } else {
-                        // skip
-                        if (dWire === 0) {
-                            dOffset += readVarint(dOffset).consumed;
-                        } else if (dWire === 2) {
-                            dOffset += readLengthDelimited(dOffset).totalConsumed;
-                        } else break;
-                    }
-                }
-                dims.push(dimValue !== null ? dimValue : dimParam || "?");
-            } else {
-                if (wireType === 0) {
-                    offset += readVarint(offset).consumed;
-                } else if (wireType === 2) {
-                    offset += readLengthDelimited(offset).totalConsumed;
-                } else break;
-            }
-        }
-        return dims;
-    }
-
-    function parseTypeProto(data) {
-        // TypeProto -> tensor_type (tag 1, Tensor)
-        let offset = 0;
-        while (offset < data.length) {
-            const { tag, wireType, consumed } = readTag(offset);
-            offset += consumed;
-            if (tag === 1 && wireType === 2) {
-                const inner = readLengthDelimited(offset);
-                offset += inner.totalConsumed;
-                // Parse Tensor: elem_type (tag 1, int32), shape (tag 2, TensorShapeProto)
-                let iOffset = 0;
-                const iData = inner.data;
-                let elemType = 0;
-                let shape = null;
-                while (iOffset < iData.length) {
-                    const { tag: iTag, wireType: iWire, consumed: iC } = readTag(iOffset);
-                    iOffset += iC;
-                    if (iTag === 1 && iWire === 0) {
-                        const v = readVarint(iOffset);
-                        elemType = Number(v.value);
-                        iOffset += v.consumed;
-                    } else if (iTag === 2 && iWire === 2) {
-                        const s = readLengthDelimited(iOffset);
-                        shape = parseTensorShape(s.data);
-                        iOffset += s.totalConsumed;
-                    } else {
-                        if (iWire === 0) iOffset += readVarint(iOffset).consumed;
-                        else if (iWire === 2) iOffset += readLengthDelimited(iOffset).totalConsumed;
-                        else break;
-                    }
-                }
-                return { dtype: ONNX_DTYPES[elemType] || `type_${elemType}`, shape };
-            } else {
-                if (wireType === 0) offset += readVarint(offset).consumed;
-                else if (wireType === 2) offset += readLengthDelimited(offset).totalConsumed;
-                else break;
-            }
-        }
-        return { dtype: "unknown", shape: null };
-    }
-
-    function parseValueInfo(data) {
-        // ValueInfoProto -> name (tag 1, string), type (tag 2, TypeProto)
-        let offset = 0;
-        let name = "";
-        let typeInfo = null;
-        while (offset < data.length) {
-            const { tag, wireType, consumed } = readTag(offset);
-            offset += consumed;
-            if (tag === 1 && wireType === 2) {
-                const s = readLengthDelimited(offset);
-                name = readString(s.data);
-                offset += s.totalConsumed;
-            } else if (tag === 2 && wireType === 2) {
-                const t = readLengthDelimited(offset);
-                typeInfo = parseTypeProto(t.data);
-                offset += t.totalConsumed;
-            } else {
-                if (wireType === 0) offset += readVarint(offset).consumed;
-                else if (wireType === 2) offset += readLengthDelimited(offset).totalConsumed;
-                else break;
-            }
-        }
-        return { name, ...typeInfo };
-    }
-
-    // Walk top-level ModelProto -> graph (tag 7, GraphProto)
-    // GraphProto -> input (tag 11, repeated ValueInfoProto), output (tag 12, repeated ValueInfoProto)
-    const inputs = [];
-    const outputs = [];
-
-    let offset = 0;
-    while (offset < bytes.length) {
-        const { tag, wireType, consumed } = readTag(offset);
-        offset += consumed;
-        if (tag === 7 && wireType === 2) {
-            // graph
-            const graphData = readLengthDelimited(offset);
-            offset += graphData.totalConsumed;
-            let gOffset = 0;
-            const gData = graphData.data;
-            while (gOffset < gData.length) {
-                const { tag: gTag, wireType: gWire, consumed: gC } = readTag(gOffset);
-                gOffset += gC;
-                if (gTag === 11 && gWire === 2) {
-                    const vi = readLengthDelimited(gOffset);
-                    inputs.push(parseValueInfo(vi.data));
-                    gOffset += vi.totalConsumed;
-                } else if (gTag === 12 && gWire === 2) {
-                    const vi = readLengthDelimited(gOffset);
-                    outputs.push(parseValueInfo(vi.data));
-                    gOffset += vi.totalConsumed;
-                } else {
-                    if (gWire === 0) gOffset += readVarint(gOffset).consumed;
-                    else if (gWire === 2) gOffset += readLengthDelimited(gOffset).totalConsumed;
-                    else if (gWire === 1) gOffset += 8;
-                    else if (gWire === 5) gOffset += 4;
-                    else break;
-                }
-            }
-            break;
-        } else {
-            if (wireType === 0) offset += readVarint(offset).consumed;
-            else if (wireType === 2) offset += readLengthDelimited(offset).totalConsumed;
-            else if (wireType === 1) offset += 8;
-            else if (wireType === 5) offset += 4;
-            else break;
-        }
-    }
-
-    return { inputs, outputs };
-}
-
-// Probe input shape by trying common HTDemucs shapes
-// Returns the first shape that succeeds, or throws if all fail
-async function probeInputShape(session, modelConfig) {
-    const candidates = [
-        { shape: [1, 2, 343980], label: "Intel reference (7.8s @ 44.1kHz)" },
-        { shape: [1, 2, 441000], label: "demucs-onnx demo (10s @ 44.1kHz)" },
-        { shape: [2, 343980], label: "Intel ref, no batch" },
-        { shape: [1, 1, 343980], label: "Mono Intel ref" },
-    ];
-
-    const primaryInputName = session.inputNames[0];
-    const extras = modelConfig?.extraInputs || [];
-
-    for (const candidate of candidates) {
-        try {
-            log(`Probing shape ${JSON.stringify(candidate.shape)} (${candidate.label})...`);
-            const size = candidate.shape.reduce((a, b) => a * b, 1);
-            const dummy = new Float32Array(size);
-            const tensor = new ort.Tensor("float32", dummy, candidate.shape);
-            const feeds = {};
-            feeds[primaryInputName] = tensor;
-            for (const extra of extras) {
-                const extraSize = extra.shape.reduce((a, b) => a * b, 1);
-                const extraData = new Float32Array(extraSize);
-                feeds[extra.name] = new ort.Tensor("float32", extraData, extra.shape);
-            }
-
-            const startTime = performance.now();
-            const outputs = await session.run(feeds);
-            const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
-
-            const outputName = modelConfig?.primaryOutput || session.outputNames[0];
-            const outputTensor = outputs[outputName];
-            log(`✓ Shape ${JSON.stringify(candidate.shape)} succeeded in ${elapsed}s`);
-            log(`  Output "${outputName}" dtype: ${outputTensor.type}, shape: [${outputTensor.dims.join(", ")}]`);
-
-            return {
-                inputShape: candidate.shape,
-                inputDtype: "float32",
-                outputShape: outputTensor.dims,
-                outputDtype: outputTensor.type,
-                label: candidate.label,
-            };
-        } catch (err) {
-            log(`  ✗ ${err.message?.substring(0, 150) || "failed"}`);
-            continue;
-        }
-    }
-    throw new Error("Could not probe input shape");
-}
-
-async function renderTensorInfo(session, modelBuffer, modelConfig) {
-    const inputTable = document.getElementById("input-table").querySelector("tbody");
-    const outputTable = document.getElementById("output-table").querySelector("tbody");
-    inputTable.innerHTML = "";
-    outputTable.innerHTML = "";
-
-    // Try parsing ONNX directly for shape info
-    let parsed = { inputs: [], outputs: [] };
-    try {
-        parsed = parseOnnxIoShapes(modelBuffer);
-    } catch (err) {
-        log(`⚠️ ONNX shape parse failed: ${err.message}`);
-    }
-
-    function formatShape(shape) {
-        if (!shape) return "(unknown)";
-        return "[" + shape.join(", ") + "]";
-    }
-
-    function findParsed(list, name) {
-        return list.find(x => x.name === name);
-    }
-
-    log("");
-    log("=== INPUTS (from protobuf) ===");
-    const inputs = [];
-    for (const name of session.inputNames) {
-        const p = findParsed(parsed.inputs, name);
-        const dtype = p?.dtype || "unknown";
-        const shape = formatShape(p?.shape);
-        log(`  ${name}: ${dtype} ${shape}`);
-        inputs.push({ name, dtype, shape, shapeArr: p?.shape });
-    }
-
-    log("");
-    log("=== OUTPUTS (from protobuf) ===");
-    const outputs = [];
-    for (const name of session.outputNames) {
-        const p = findParsed(parsed.outputs, name);
-        const dtype = p?.dtype || "unknown";
-        const shape = formatShape(p?.shape);
-        log(`  ${name}: ${dtype} ${shape}`);
-        outputs.push({ name, dtype, shape, shapeArr: p?.shape });
-    }
-
-    // Skip probe for fwd-only models (we know the shapes and probe wouldn't work
-    // without feeding both x and xt at the right shapes).
-    const needsProbe = !modelConfig?.fwdOnly && inputs.every(i => i.dtype === "unknown" || !i.shapeArr);
-    let probeResult = null;
-    if (modelConfig?.fwdOnly) {
-        log("");
-        log(
-            "fwd-only model: skipping probe. Inputs x=[1,4,2048,336], xt=[1,2,343980]; outputs x_out=[1,16,2048,336], xt_out=[1,8,343980].",
-        );
-    }
-    if (needsProbe) {
-        log("");
-        log("Protobuf parse inconclusive — probing by running inference with candidate shapes...");
-        try {
-            probeResult = await probeInputShape(session, modelConfig);
-            inputs[0].dtype = probeResult.inputDtype;
-            inputs[0].shape = formatShape(probeResult.inputShape);
-            inputs[0].shapeArr = probeResult.inputShape;
-            outputs[0].dtype = probeResult.outputDtype;
-            outputs[0].shape = formatShape(probeResult.outputShape);
-            outputs[0].shapeArr = probeResult.outputShape;
-        } catch (err) {
-            log(`✗ Probe failed: ${err.message}`);
-        }
-    }
-
-    // Render tables
-    for (const inp of inputs) {
-        const row = document.createElement("tr");
-        row.innerHTML = `<td><code>${inp.name}</code></td><td>${inp.dtype}</td><td><code>${inp.shape}</code></td>`;
-        inputTable.appendChild(row);
-    }
-    for (const out of outputs) {
-        const row = document.createElement("tr");
-        row.innerHTML = `<td><code>${out.name}</code></td><td>${out.dtype}</td><td><code>${out.shape}</code></td>`;
-        outputTable.appendChild(row);
-    }
-
-    document.getElementById("tensor-info-card").style.display = "block";
-
-    // Strategy verdict
-    const verdictEl = document.getElementById("strategy-verdict");
-    let verdict = "";
-    if (inputs.length === 1) {
-        verdict =
-            "<strong>Strategy B detected:</strong> Single input — STFT is likely baked into the model. JS feeds raw waveform and decodes waveform output. ";
-        const shapeStr = inputs[0].shape;
-        if (shapeStr.includes("343980")) {
-            verdict += "<br>Segment length <strong>343980</strong> matches Intel reference (7.8s @ 44100 Hz).";
-        } else if (shapeStr.includes("441000")) {
-            verdict += "<br>Segment length <strong>441000</strong> matches demucs-onnx demo (10s @ 44100 Hz).";
-        } else {
-            verdict += `<br>Shape: ${shapeStr}.`;
-        }
-
-        if (outputs[0].shapeArr) {
-            const outShape = outputs[0].shapeArr;
-            // HTDemucs outputs 4 stems × 2 channels × N samples
-            // Common shapes: [1, 4, 2, N] or [1, 8, N] (flat) or [4, 2, N]
-            if (outShape.length >= 3) {
-                verdict += `<br>Output [${outShape.join(", ")}] — likely 4 stems (drums/bass/other/vocals).`;
-            }
-        }
-    } else if (inputs.length === 2) {
-        verdict =
-            "<strong>Strategy A detected:</strong> Two inputs — likely (waveform, spectrogram). JS must compute STFT before inference and iSTFT after.";
-    } else {
-        verdict = `<strong>Unexpected:</strong> ${inputs.length} inputs. Review the table and consult HTDemucs reference code.`;
-    }
-    verdictEl.innerHTML = verdict;
-
-    return { inputs, outputs };
-}
-
-// ============================================================================
-// Audio ingest and chunking
-// ============================================================================
-
-const TARGET_SAMPLE_RATE = 44100;
-const SEGMENT_LENGTH = 343980;
-const OVERLAP = 171990;
-const HOP = SEGMENT_LENGTH - OVERLAP;
-
-async function decodeAudioFile(file) {
-    const arrayBuffer = await file.arrayBuffer();
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-    ctx.close();
-    return audioBuffer;
-}
-
-async function resampleTo44100(audioBuffer) {
-    if (audioBuffer.sampleRate === TARGET_SAMPLE_RATE) return audioBuffer;
-    const targetLength = Math.ceil(audioBuffer.duration * TARGET_SAMPLE_RATE);
-    const offline = new OfflineAudioContext(audioBuffer.numberOfChannels, targetLength, TARGET_SAMPLE_RATE);
-    const source = offline.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(offline.destination);
-    source.start(0);
-    return await offline.startRendering();
-}
-
-function toStereo(audioBuffer) {
-    const channels = audioBuffer.numberOfChannels;
-    const N = audioBuffer.length;
-    if (channels === 1) {
-        const mono = audioBuffer.getChannelData(0);
-        const copy = new Float32Array(N);
-        copy.set(mono);
-        return { left: mono, right: copy, droppedChannels: 0 };
-    }
-    if (channels >= 2) {
-        const left = audioBuffer.getChannelData(0);
-        const right = audioBuffer.getChannelData(1);
-        return { left, right, droppedChannels: channels - 2 };
-    }
-    throw new Error(`Unexpected channel count: ${channels}`);
-}
-
-function chunkStereo(left, right) {
-    const N = left.length;
-    const count = Math.max(1, Math.ceil((N - OVERLAP) / HOP));
-    const segments = [];
-    for (let i = 0; i < count; i++) {
-        const start = i * HOP;
-        const end = start + SEGMENT_LENGTH;
-        const data = new Float32Array(2 * SEGMENT_LENGTH);
-        const copyLen = Math.max(0, Math.min(SEGMENT_LENGTH, N - start));
-        if (copyLen > 0) {
-            data.set(left.subarray(start, start + copyLen), 0);
-            data.set(right.subarray(start, start + copyLen), SEGMENT_LENGTH);
-        }
-        const padSamples = SEGMENT_LENGTH - copyLen;
-        segments.push({ data, startSample: start, isLast: i === count - 1, padSamples });
-    }
-    return { segments, totalSamples: N };
-}
-
-function formatSamples(n) {
-    return `${n.toLocaleString()} samples (${(n / TARGET_SAMPLE_RATE).toFixed(2)}s)`;
-}
-
-async function handleAudioFile(file) {
-    const infoEl = document.getElementById("audio-info");
-    infoEl.innerHTML = "<em>Decoding...</em>";
-    log("");
-    log(`=== AUDIO INGEST: ${file.name} (${(file.size / 1048576).toFixed(2)} MB) ===`);
-    const decoded = await decodeAudioFile(file);
-    log(
-        `Source: ${decoded.sampleRate} Hz, ${decoded.numberOfChannels} ch, ${decoded.duration.toFixed(2)}s, ${decoded.length.toLocaleString()} samples`,
-    );
-    infoEl.innerHTML = "<em>Resampling...</em>";
-    const resampled = await resampleTo44100(decoded);
-    if (resampled === decoded) {
-        log(`Resample: not needed (already 44100 Hz)`);
-    } else {
-        log(`Resampled: 44100 Hz, ${resampled.numberOfChannels} ch, ${resampled.length.toLocaleString()} samples`);
-    }
-    const { left, right, droppedChannels } = toStereo(resampled);
-    if (droppedChannels > 0) {
-        log(`⚠️ Source had ${resampled.numberOfChannels} channels; took first 2, dropped ${droppedChannels}`);
-    } else if (resampled.numberOfChannels === 1) {
-        log(`Mono → duplicated to stereo`);
-    }
-    const { segments, totalSamples } = chunkStereo(left, right);
-    log(`Chunked: ${segments.length} segments, hop=${HOP}, overlap=${OVERLAP}`);
-    const last = segments[segments.length - 1];
-    log(`Last segment: start=${last.startSample.toLocaleString()}, pad=${last.padSamples.toLocaleString()} samples`);
-    const firstSeg = segments[0].data;
-    const sampleL = Array.from(firstSeg.subarray(0, 5)).map(value => value.toFixed(4));
-    const sampleR = Array.from(firstSeg.subarray(SEGMENT_LENGTH, SEGMENT_LENGTH + 5)).map(value => value.toFixed(4));
-    log(`Sanity L[0..5]: [${sampleL.join(", ")}]`);
-    log(`Sanity R[0..5]: [${sampleR.join(", ")}]`);
-    const inputAudio = document.getElementById("input-audio");
-    inputAudio.src = URL.createObjectURL(file);
-    inputAudio.hidden = false;
-    const inputWaveform = document.getElementById("input-waveform");
-    inputWaveform.hidden = false;
-    setupWaveform(inputWaveform, left, right, inputAudio, "#3f6f9f");
-    infoEl.innerHTML = `
-        <details class="audio-details">
-          <summary>Audio details</summary>
-          <table class="tensor-table">
-            <tr><th>Source</th><td>${decoded.sampleRate} Hz · ${decoded.numberOfChannels} ch · ${decoded.duration.toFixed(2)}s</td></tr>
-            <tr><th>Resampled</th><td>${resampled === decoded ? "(not needed)" : `44100 Hz · ${formatSamples(resampled.length)}`}</td></tr>
-            <tr><th>Total samples @ 44.1kHz</th><td>${formatSamples(totalSamples)}</td></tr>
-            <tr><th>Segments</th><td>${segments.length} × ${SEGMENT_LENGTH} samples (hop ${HOP}, overlap ${OVERLAP})</td></tr>
-            <tr><th>Last segment padding</th><td>${last.padSamples.toLocaleString()} samples</td></tr>
-          </table>
-        </details>
-        <div class="audio-ready">Audio ready for separation.</div>
-      `;
-    window.__htdemucsChunks = {
-        segments,
-        totalSamples,
-        left,
-        right,
-        sourceSampleRate: decoded.sampleRate,
-        sourceChannels: decoded.numberOfChannels,
-        sourceFilename: file.name,
-    };
-    log(`✓ Audio prepared for separation.`);
-    const inferBtn = document.getElementById("infer-btn");
-    if (window.__htdemucsSession) {
-        inferBtn.disabled = false;
-        document.getElementById("infer-gate-msg").textContent = "(Ready — click Start Separation.)";
-    }
-}
-
-// ============================================================================
-// STFT for HTDemucs pre_forward.
-// Matches demucs4ht._spec: n_fft=4096, hop=1024, Hann window, reflect pad
-// (1536, 1536 + le*hop - N), drop Nyquist bin, time-slice [2 : 2+le].
-// ============================================================================
-
-const STFT_N_FFT = 4096;
-const STFT_HOP = 1024;
-const STFT_FREQ_BINS = 2048;
-const STFT_TIME_FRAMES = 336;
-// Demucs does TWO sequential reflect pads: first (1536, 1536+remainder)
-// to align hop-divisibility, then torch.stft center=True adds another
-// (2048, 2048). Sequential reflects produce a zigzag pattern that is NOT
-// equivalent to a single combined reflect — we must apply them in order.
-const STFT_DEMUCS_PAD_LEFT = 1536;
-const STFT_CENTER_PAD = STFT_N_FFT / 2; // 2048
-// torch.stft normalized=True divides the FFT output by sqrt(n_fft).
-const STFT_NORM = 1.0 / Math.sqrt(STFT_N_FFT);
-
-function buildHannWindow(size) {
-    const window = new Float32Array(size);
-    for (let i = 0; i < size; i++) {
-        window[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / size);
-    }
-    return window;
-}
-
-function buildFftTwiddles(n) {
-    const cos = new Float32Array(n / 2);
-    const sin = new Float32Array(n / 2);
-    for (let i = 0; i < n / 2; i++) {
-        const angle = (-2 * Math.PI * i) / n;
-        cos[i] = Math.cos(angle);
-        sin[i] = Math.sin(angle);
-    }
-    return { cos, sin };
-}
-
-function buildBitReverseTable(n) {
-    const table = new Uint32Array(n);
-    const bits = Math.log2(n) | 0;
-    for (let i = 0; i < n; i++) {
-        let rev = 0;
-        let value = i;
-        for (let b = 0; b < bits; b++) {
-            rev = (rev << 1) | (value & 1);
-            value >>= 1;
-        }
-        table[i] = rev;
-    }
-    return table;
-}
-
-const HANN_4096 = buildHannWindow(STFT_N_FFT);
-const FFT_TWIDDLES_4096 = buildFftTwiddles(STFT_N_FFT);
-const FFT_BITREV_4096 = buildBitReverseTable(STFT_N_FFT);
-
-// In-place iterative radix-2 Cooley-Tukey FFT on real/imag pair.
-function fftInPlace(real, imag, n, twiddles, bitRev) {
-    for (let i = 0; i < n; i++) {
-        const j = bitRev[i];
-        if (j > i) {
-            const tmpR = real[i];
-            real[i] = real[j];
-            real[j] = tmpR;
-            const tmpI = imag[i];
-            imag[i] = imag[j];
-            imag[j] = tmpI;
-        }
-    }
-    for (let size = 2; size <= n; size <<= 1) {
-        const half = size >> 1;
-        const step = n / size;
-        for (let start = 0; start < n; start += size) {
-            for (let k = 0; k < half; k++) {
-                const tIdx = k * step;
-                const wR = twiddles.cos[tIdx];
-                const wI = twiddles.sin[tIdx];
-                const idxEven = start + k;
-                const idxOdd = start + k + half;
-                const eR = real[idxEven];
-                const eI = imag[idxEven];
-                const oR = real[idxOdd];
-                const oI = imag[idxOdd];
-                const tR = wR * oR - wI * oI;
-                const tI = wR * oI + wI * oR;
-                real[idxEven] = eR + tR;
-                imag[idxEven] = eI + tI;
-                real[idxOdd] = eR - tR;
-                imag[idxOdd] = eI - tI;
-            }
-        }
-    }
-}
-
-function padReflect1d(signal, padLeft, padRight) {
-    const N = signal.length;
-    const out = new Float32Array(padLeft + N + padRight);
-    out.set(signal, padLeft);
-    for (let i = 0; i < padLeft; i++) {
-        out[padLeft - 1 - i] = signal[i + 1];
-    }
-    for (let i = 0; i < padRight; i++) {
-        out[padLeft + N + i] = signal[N - 2 - i];
-    }
-    return out;
-}
-
-// Preallocated FFT scratch buffers (reused across frames and channels).
-const FFT_SCRATCH_REAL = new Float32Array(STFT_N_FFT);
-const FFT_SCRATCH_IMAG = new Float32Array(STFT_N_FFT);
-
-// Compute STFT of a single channel and write real/imag interleaved into dst.
-// dst layout (channel c within [1,4,2048,336]): real at offset cReal*2048*336, imag at cImag*2048*336.
-// Returns nothing; dst is filled for freq bins 0..2047 and time frames 0..335.
-function computeStftChannel(signal, dst, realChannelOffset, imagChannelOffset) {
-    // Step 1: Demucs pre-pad (1536, 1536 + le*hop - N) reflect.
-    // le must satisfy: we need (STFT_TIME_FRAMES + 2) frames from the centered STFT.
-    // After center pad, n_frames = floor((pre1_len + 2*center) / hop) + 1... but
-    // torch.stft center=True yields n_frames = floor(pre1_len / hop) + 1.
-    // Demucs asserts z.shape[-1] == le + 4, so we need le + 4 >= STFT_TIME_FRAMES + 2.
-    // Set le = STFT_TIME_FRAMES - 2 when it divides evenly, else ceil(N/hop).
-    const N = signal.length;
-    const le = Math.max(Math.ceil(N / STFT_HOP), STFT_TIME_FRAMES - 2);
-    const padRight1 = STFT_DEMUCS_PAD_LEFT + le * STFT_HOP - N;
-    const pre1 = padReflect1d(signal, STFT_DEMUCS_PAD_LEFT, padRight1);
-    // Step 2: torch.stft center=True adds reflect pad (n_fft/2, n_fft/2).
-    const pre2 = padReflect1d(pre1, STFT_CENTER_PAD, STFT_CENTER_PAD);
-    // Step 3: frame and FFT. torch.stft center=True → n_frames = floor(pre1.len / hop) + 1.
-    const numFrames = Math.floor(pre1.length / STFT_HOP) + 1;
-    // Demucs slices z[..., 2 : 2+le]. We need STFT_TIME_FRAMES frames starting from index 2.
-    for (let frameIdx = 0; frameIdx < STFT_TIME_FRAMES; frameIdx++) {
-        const sourceFrame = frameIdx + 2;
-        if (sourceFrame >= numFrames) {
-            for (let f = 0; f < STFT_FREQ_BINS; f++) {
-                dst[realChannelOffset + f * STFT_TIME_FRAMES + frameIdx] = 0;
-                dst[imagChannelOffset + f * STFT_TIME_FRAMES + frameIdx] = 0;
-            }
-            continue;
-        }
-        const sampleStart = sourceFrame * STFT_HOP;
-        for (let i = 0; i < STFT_N_FFT; i++) {
-            FFT_SCRATCH_REAL[i] = pre2[sampleStart + i] * HANN_4096[i];
-            FFT_SCRATCH_IMAG[i] = 0;
-        }
-        fftInPlace(FFT_SCRATCH_REAL, FFT_SCRATCH_IMAG, STFT_N_FFT, FFT_TWIDDLES_4096, FFT_BITREV_4096);
-        for (let f = 0; f < STFT_FREQ_BINS; f++) {
-            dst[realChannelOffset + f * STFT_TIME_FRAMES + frameIdx] = FFT_SCRATCH_REAL[f] * STFT_NORM;
-            dst[imagChannelOffset + f * STFT_TIME_FRAMES + frameIdx] = FFT_SCRATCH_IMAG[f] * STFT_NORM;
-        }
-    }
-}
-
-// Build x tensor [1, 4, 2048, 336] with layout [real_L, imag_L, real_R, imag_R].
-// segmentData is the segment's planar stereo Float32Array(2 * 343980).
-function buildSpectrogramInput(segmentData, dst) {
-    const realL = 0 * STFT_FREQ_BINS * STFT_TIME_FRAMES;
-    const imagL = 1 * STFT_FREQ_BINS * STFT_TIME_FRAMES;
-    const realR = 2 * STFT_FREQ_BINS * STFT_TIME_FRAMES;
-    const imagR = 3 * STFT_FREQ_BINS * STFT_TIME_FRAMES;
-    const leftView = segmentData.subarray(0, SEGMENT_LENGTH);
-    const rightView = segmentData.subarray(SEGMENT_LENGTH, 2 * SEGMENT_LENGTH);
-    computeStftChannel(leftView, dst, realL, imagL);
-    computeStftChannel(rightView, dst, realR, imagR);
-}
-
-// ============================================================================
-// Inverse FFT (real output) + inverse STFT — mirror of forward STFT.
-// Matches demucs.spec.ispectro: torch.istft(z, n_fft, hop, window=hann, win_length=n_fft,
-//                                          normalized=True, center=True, length=le)
-// ============================================================================
-
-// In-place inverse FFT on real/imag pair, size = STFT_N_FFT.
-// ifft(x) = conj(fft(conj(x))) / n
-function ifftInPlace(real, imag, n, twiddles, bitRev) {
-    for (let i = 0; i < n; i++) imag[i] = -imag[i];
-    fftInPlace(real, imag, n, twiddles, bitRev);
-    const invN = 1 / n;
-    for (let i = 0; i < n; i++) {
-        real[i] = real[i] * invN;
-        imag[i] = -imag[i] * invN;
-    }
-}
-
-// Inverse STFT for one channel.
-// Input: real/imag arrays of length STFT_FREQ_BINS_FULL * numFrames (hermitian half-spectrum).
-//        STFT_FREQ_BINS_FULL = 2049 (freq dim), numFrames = frames in input.
-// Demucs _ispec pre-pads: F.pad(z, (0,0,0,1)) adds 1 zero freq bin (back to 2049 from 2048),
-//                        then F.pad(z, (2,2)) adds 2 zero frames each side.
-// istft with center=True reflect-pads by n_fft/2 internally and strips matching output samples.
-// Caller handles trimming (demucs does x[..., pad : pad + length] with pad = 3*hop/2 = 1536).
-// Here we produce the raw center-aligned output of length (numFrames - 1) * hop + n_fft
-// minus n_fft (because center=True trims n_fft/2 at each end), i.e. (numFrames - 1) * hop.
-//
-// Normalization: torch.istft with normalized=True multiplies by sqrt(n_fft). Our forward
-// multiplied by 1/sqrt(n_fft), so the inverse must multiply by sqrt(n_fft).
-//
-// Full complex bins (STFT_FREQ_BINS_FULL = n_fft/2 + 1 = 2049). We fill the upper half
-// from the hermitian symmetry: X[n_fft - k] = conj(X[k]) for k=1..n_fft/2-1.
-function computeIstftChannel(realFrames, imagFrames, numFrames) {
-    const nFft = STFT_N_FFT;
-    const hop = STFT_HOP;
-    const nHalfPlusOne = nFft / 2 + 1; // 2049
-    const nyquistIdx = nFft / 2; // 2048
-    const centerPad = nFft / 2; // 2048 (stripped by center=True)
-    const rawLen = (numFrames - 1) * hop + nFft;
-    const acc = new Float32Array(rawLen);
-    const winSum = new Float32Array(rawLen);
-    const scale = Math.sqrt(nFft); // counteracts forward normalized=True
-
-    for (let frameIdx = 0; frameIdx < numFrames; frameIdx++) {
-        // Build full-size complex spectrum using hermitian symmetry.
-        for (let k = 0; k < nHalfPlusOne; k++) {
-            FFT_SCRATCH_REAL[k] = realFrames[k * numFrames + frameIdx];
-            FFT_SCRATCH_IMAG[k] = imagFrames[k * numFrames + frameIdx];
-        }
-        // Reflect/conjugate to fill bins nHalfPlusOne..nFft-1 — skip bin 0 (DC) and bin nyquistIdx.
-        for (let k = 1; k < nyquistIdx; k++) {
-            FFT_SCRATCH_REAL[nFft - k] = FFT_SCRATCH_REAL[k];
-            FFT_SCRATCH_IMAG[nFft - k] = -FFT_SCRATCH_IMAG[k];
-        }
-        ifftInPlace(FFT_SCRATCH_REAL, FFT_SCRATCH_IMAG, nFft, FFT_TWIDDLES_4096, FFT_BITREV_4096);
-        // Apply synthesis window (Hann) and overlap-add.
-        const base = frameIdx * hop;
-        for (let i = 0; i < nFft; i++) {
-            const w = HANN_4096[i];
-            acc[base + i] += FFT_SCRATCH_REAL[i] * w * scale;
-            winSum[base + i] += w * w;
-        }
-    }
-    // Divide by sum-of-windows for proper overlap-add reconstruction (COLA).
-    for (let i = 0; i < rawLen; i++) {
-        if (winSum[i] > 1e-8) acc[i] /= winSum[i];
-    }
-    // Strip center pad: torch istft with center=True chops n_fft/2 off each side.
-    const trimmed = new Float32Array(rawLen - 2 * centerPad);
-    trimmed.set(acc.subarray(centerPad, rawLen - centerPad));
-    return trimmed;
-}
-
-// ============================================================================
-// HTDemucs pre_forward: internal normalization of x (CAC magnitude) and xt (waveform)
-// Matches models/demucs4ht.py:548-585
-// ============================================================================
-
-const HT_EPS = 1e-5;
-
-// x: [1, 4, 2048, 336] flat, length = 4*2048*336 = 2752512
-// Python: mean/std over dims (1,2,3) with keepdim=True → single scalar
-// PyTorch torch.Tensor.std uses unbiased=True (Bessel correction, divide by n-1).
-function htdemucsNormalizeX(x) {
-    const n = x.length;
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += x[i];
-    const mean = sum / n;
-    let sqSum = 0;
-    for (let i = 0; i < n; i++) {
-        const diff = x[i] - mean;
-        sqSum += diff * diff;
-    }
-    const std = Math.sqrt(sqSum / (n - 1)); // unbiased
-    const invDenom = 1 / (HT_EPS + std);
-    for (let i = 0; i < n; i++) x[i] = (x[i] - mean) * invDenom;
-    return { mean, std };
-}
-
-// xt: [1, 2, N] flat (planar L then R), length = 2*N
-// Python: meant/stdt over dims (1,2) with keepdim=True → single scalar
-function htdemucsNormalizeXt(xt) {
-    const n = xt.length;
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += xt[i];
-    const meant = sum / n;
-    let sqSum = 0;
-    for (let i = 0; i < n; i++) {
-        const diff = xt[i] - meant;
-        sqSum += diff * diff;
-    }
-    const stdt = Math.sqrt(sqSum / (n - 1));
-    const invDenom = 1 / (HT_EPS + stdt);
-    for (let i = 0; i < n; i++) xt[i] = (xt[i] - meant) * invDenom;
-    return { meant, stdt };
-}
-
-// Full pre_forward: consumes a raw segment [2, SEGMENT] planar and produces
-// normalized x, xt, and the norm stats needed later for post_forward.
-function htdemucsPreForward(segmentData) {
-    const xBuf = new Float32Array(1 * 4 * STFT_FREQ_BINS * STFT_TIME_FRAMES);
-    buildSpectrogramInput(segmentData, xBuf);
-    const { mean, std } = htdemucsNormalizeX(xBuf);
-    const xtBuf = new Float32Array(segmentData.length);
-    xtBuf.set(segmentData);
-    const { meant, stdt } = htdemucsNormalizeXt(xtBuf);
-    return { xBuf, xtBuf, mean, std, meant, stdt };
-}
-
-// Full post_forward: consumes the 2 ONNX fwd outputs + stats from pre_forward,
-// returns [1, 4, 2, SEGMENT] waveform stems as a single Float32Array.
-//
-// Matches models/demucs4ht.py:post_forward for num_subbands=1, cac=True, use_train_segment=True,
-// training=False, length=SEGMENT, length_pre_pad=None.
-//
-// Inputs:
-//   xOut   Float32Array length 1*16*2048*336 -- ONNX x_out
-//   xtOut  Float32Array length 1*8*343980    -- ONNX xt_out
-//   mean, std, meant, stdt  scalars captured by pre_forward
-// Returns:
-//   Float32Array length 1*4*2*SEGMENT  -- stems [1, S=4, C=2, SEGMENT]
-function htdemucsPostForward(xOut, xtOut, mean, std, meant, stdt) {
-    const B = 1,
-        S = 4,
-        CAC = 4,
-        FR = STFT_FREQ_BINS,
-        T = STFT_TIME_FRAMES;
-    const FR_PLUS_1 = FR + 1; // 2049 after pad-freq
-    const T_PLUS_4 = T + 4; // 340 after pad-time (+2 each side)
-    // Step 1: reshape x_out [1, 16, 2048, 336] -> [1, 4, 4, 2048, 336] is free (same layout).
-    // Step 2: de-normalize: x = x * std + mean.
-    //   We build directly into real/imag per-stem-per-channel buffers while walking x_out.
-    //   Source index for (s, cac, f, t): s * 4*FR*T + cac * FR*T + f * T + t.
-    //   Layout of cac: [real_L, imag_L, real_R, imag_R] (matches forward _magnitude).
-    //
-    // Per stem + stereo channel we need a complex spectrogram with
-    //   freq bins 0..FR_PLUS_1-1  (index FR is a zero-pad row)
-    //   time frames 0..T_PLUS_4-1 (indices 0,1 and 2+T,2+T+1 are zero-pad columns, middle T slots are real data)
-    //
-    // Storage per (s, c) channel: two Float32Array(FR_PLUS_1 * T_PLUS_4) for real/imag.
-    // Total: 4 stems * 2 channels * 2 (real/imag) = 16 big buffers.
-    const FR_STRIDE = T_PLUS_4;
-    const nBinsFull = FR_PLUS_1 * T_PLUS_4;
-    const sources = new Float32Array(1 * S * 2 * SEGMENT_LENGTH);
-    const sampleRate = TARGET_SAMPLE_RATE; // for potential later use
-    // Scratch per channel (reused across stems to bound memory).
-    const realBuf = new Float32Array(nBinsFull);
-    const imagBuf = new Float32Array(nBinsFull);
-    for (let s = 0; s < S; s++) {
-        for (let chan = 0; chan < 2; chan++) {
-            const cacRealIdx = s * (CAC * FR * T) + (chan * 2 + 0) * (FR * T);
-            const cacImagIdx = s * (CAC * FR * T) + (chan * 2 + 1) * (FR * T);
-            // Zero the scratch (pad rows / pad columns will stay zero).
-            realBuf.fill(0);
-            imagBuf.fill(0);
-            // Fill real data: freq bins 0..FR-1, time frames 2..2+T-1 (skipping 2 zero-pad cols at start).
-            for (let f = 0; f < FR; f++) {
-                for (let t = 0; t < T; t++) {
-                    const srcR = cacRealIdx + f * T + t;
-                    const srcI = cacImagIdx + f * T + t;
-                    const dst = f * T_PLUS_4 + (t + 2);
-                    realBuf[dst] = xOut[srcR] * std + mean;
-                    imagBuf[dst] = xOut[srcI] * std + mean;
-                }
-            }
-            // Bin FR (Nyquist) stays 0 everywhere.
-            // Time slots 0, 1, T+2, T+3 stay 0 (reflect-like zero padding).
-            // Step 4: iSTFT this channel's complex spectrogram.
-            const wave = computeIstftChannel(realBuf, imagBuf, T_PLUS_4);
-            // wave length is (T_PLUS_4 - 1) * hop = 339 * 1024 = 347136.
-            // Demucs trims x[..., pad : pad + length] with pad = 3*hop/2 = 1536.
-            const trimStart = (STFT_HOP / 2) * 3; // 1536
-            // Step 5: add xt contribution (already de-normalized separately below).
-            // Here we only write x contribution; xt will be added in a second pass.
-            const dstBase = s * (2 * SEGMENT_LENGTH) + chan * SEGMENT_LENGTH;
-            for (let i = 0; i < SEGMENT_LENGTH; i++) {
-                sources[dstBase + i] = wave[trimStart + i];
-            }
-        }
-    }
-    // Step 6: reshape xt_out [1, 8, SEGMENT] -> [1, 4, 2, SEGMENT] is free.
-    // Step 7: de-normalize xt: xt = xt * stdt + meant; add to sources.
-    for (let s = 0; s < S; s++) {
-        for (let chan = 0; chan < 2; chan++) {
-            const srcBase = s * (2 * SEGMENT_LENGTH) + chan * SEGMENT_LENGTH;
-            const dstBase = srcBase;
-            for (let i = 0; i < SEGMENT_LENGTH; i++) {
-                sources[dstBase + i] += xtOut[srcBase + i] * stdt + meant;
-            }
-        }
-    }
-    return sources;
-}
-
-// ============================================================================
-// Inference loop and overlap-add
-// ============================================================================
-
-const STEM_NAMES = ["drums", "bass", "other", "vocals"];
-
-function computeNormStats(left, right) {
-    const N = left.length;
-    let sum = 0;
-    for (let i = 0; i < N; i++) sum += (left[i] + right[i]) * 0.5;
-    const mean = sum / N;
-    let ss = 0;
-    for (let i = 0; i < N; i++) {
-        const ref = (left[i] + right[i]) * 0.5 - mean;
-        ss += ref * ref;
-    }
-    const std = Math.sqrt(ss / N) || 1.0;
-    return { mean, std };
-}
-
-function normalizeChannels(left, right, mean, std) {
-    const N = left.length;
-    const leftNorm = new Float32Array(N);
-    const rightNorm = new Float32Array(N);
-    const invStd = 1 / std;
-    for (let i = 0; i < N; i++) {
-        leftNorm[i] = (left[i] - mean) * invStd;
-        rightNorm[i] = (right[i] - mean) * invStd;
-    }
-    return { leftNorm, rightNorm };
-}
-
-function buildTriangularWeights() {
-    const weights = new Float32Array(SEGMENT_LENGTH);
-    for (let k = 0; k < SEGMENT_LENGTH; k++) {
-        if (k < OVERLAP) weights[k] = (k + 1) / OVERLAP;
-        else if (k >= SEGMENT_LENGTH - OVERLAP) weights[k] = (SEGMENT_LENGTH - k) / OVERLAP;
-        else weights[k] = 1.0;
-    }
-    return weights;
-}
-
-function computeStats(buffer) {
-    let peak = 0;
-    let ss = 0;
-    for (let i = 0; i < buffer.length; i++) {
-        const absValue = Math.abs(buffer[i]);
-        if (absValue > peak) peak = absValue;
-        ss += buffer[i] * buffer[i];
-    }
-    const rms = Math.sqrt(ss / buffer.length);
-    return { peak, rms };
-}
-
-async function runInference() {
-    const session = window.__htdemucsSession;
-    const chunks = window.__htdemucsChunks;
-    const modelConfig = window.__htdemucsModelConfig;
-    if (!session) throw new Error("Session not loaded — load the model first");
-    if (!chunks) throw new Error("No audio loaded — choose an audio file first");
-    if (!modelConfig) throw new Error("Model config missing — reload model");
-    const { left, right, totalSamples } = chunks;
-    const progressContainer = document.getElementById("infer-progress-container");
-    const progressFill = document.getElementById("infer-progress-fill");
-    const etaEl = document.getElementById("infer-eta");
-    const resultEl = document.getElementById("infer-result");
-    progressContainer.style.display = "block";
-    resultEl.innerHTML = "";
-    log("");
-    log(`=== SEPARATION + OVERLAP-ADD (model: ${modelConfig.label}) ===`);
-    const fwdOnly = modelConfig.fwdOnly === true;
-    const normalizeExternally = !fwdOnly && modelConfig.normalizeExternally !== false;
-    let mean = 0;
-    let std = 1;
-    let leftForInfer = left;
-    let rightForInfer = right;
-    if (normalizeExternally) {
-        log("Computing normalization stats (external)...");
-        const stats = computeNormStats(left, right);
-        mean = stats.mean;
-        std = stats.std;
-        log(`  mean=${mean.toExponential(3)}, std=${std.toExponential(3)}`);
-        const normalized = normalizeChannels(left, right, mean, std);
-        leftForInfer = normalized.leftNorm;
-        rightForInfer = normalized.rightNorm;
-    } else if (fwdOnly) {
-        log("fwd-only model: pre_forward + ONNX fwd + post_forward per segment.");
-    } else {
-        log("Skipping external normalization — model normalizes internally.");
-    }
-    log("Chunking...");
-    const { segments } = chunkStereo(leftForInfer, rightForInfer);
-    log(`  ${segments.length} segments`);
-    const weights = buildTriangularWeights();
-    const stems = [];
-    for (let s = 0; s < 4; s++) {
-        stems.push([new Float32Array(totalSamples), new Float32Array(totalSamples)]);
-    }
-    const weightSum = new Float32Array(totalSamples);
-    const inputName = session.inputNames[0];
-    const outputName = modelConfig.primaryOutput || session.outputNames[0];
-    const extraInputs = fwdOnly ? [] : modelConfig.extraInputs || [];
-    const extraBuffers = [];
-    for (const extra of extraInputs) {
-        const extraSize = extra.shape.reduce((a, b) => a * b, 1);
-        const data = new Float32Array(extraSize);
-        extraBuffers.push({
-            name: extra.name,
-            fill: extra.fill,
-            data,
-            tensor: new ort.Tensor("float32", data, extra.shape),
-        });
-        log(`  extra input "${extra.name}" shape=[${extra.shape.join(", ")}] fill=${extra.fill}`);
-    }
-    if (!fwdOnly) log(`  primary output: "${outputName}"`);
-    const t0 = performance.now();
-    let firstSegMs = 0;
-    for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-        const seg = segments[segIdx];
-        const tSeg = performance.now();
-        let sources; // Float32Array [1, 4, 2, SEGMENT] — stems for this segment
-        let segTensors = [];
-        if (fwdOnly) {
-            const { xBuf, xtBuf, mean: preMean, std: preStd, meant, stdt } = htdemucsPreForward(seg.data);
-            const xTensor = new ort.Tensor("float32", xBuf, [1, 4, STFT_FREQ_BINS, STFT_TIME_FRAMES]);
-            const xtTensor = new ort.Tensor("float32", xtBuf, [1, 2, SEGMENT_LENGTH]);
-            const output = await session.run({ x: xTensor, xt: xtTensor });
-            const xOut = output.x_out;
-            const xtOut = output.xt_out;
-            sources = htdemucsPostForward(xOut.data, xtOut.data, preMean, preStd, meant, stdt);
-            segTensors = [xOut, xtOut, xTensor, xtTensor];
-        } else {
-            const tensor = new ort.Tensor("float32", seg.data, [1, 2, SEGMENT_LENGTH]);
-            const feeds = {};
-            feeds[inputName] = tensor;
-            for (const extra of extraBuffers) {
-                if (extra.fill === "stft") {
-                    buildSpectrogramInput(seg.data, extra.data);
-                }
-                feeds[extra.name] = extra.tensor;
-            }
-            const output = await session.run(feeds);
-            const outputTensor = output[outputName];
-            sources = outputTensor.data;
-            segTensors = [outputTensor, tensor];
-        }
-        const segMs = performance.now() - tSeg;
-        if (segIdx === 0) firstSegMs = segMs;
-        const writeLimit = Math.min(SEGMENT_LENGTH, totalSamples - seg.startSample);
-        for (let s = 0; s < 4; s++) {
-            const stemL = stems[s][0];
-            const stemR = stems[s][1];
-            const offsetL = s * 2 * SEGMENT_LENGTH;
-            const offsetR = offsetL + SEGMENT_LENGTH;
-            for (let k = 0; k < writeLimit; k++) {
-                const w = weights[k];
-                const destIdx = seg.startSample + k;
-                stemL[destIdx] += sources[offsetL + k] * w;
-                stemR[destIdx] += sources[offsetR + k] * w;
-            }
-        }
-        for (let k = 0; k < writeLimit; k++) {
-            weightSum[seg.startSample + k] += weights[k];
-        }
-        for (const t of segTensors) t.dispose?.();
-        segments[segIdx] = null;
-        const elapsed = (performance.now() - t0) / 1000;
-        const pct = ((segIdx + 1) / segments.length) * 100;
-        progressFill.style.width = `${pct}%`;
-        progressFill.textContent = `${segIdx + 1} / ${segments.length}`;
-        const avgPerSeg = elapsed / (segIdx + 1);
-        const remaining = avgPerSeg * (segments.length - segIdx - 1);
-        etaEl.textContent = `Elapsed ${elapsed.toFixed(1)}s · est. remaining ${remaining.toFixed(1)}s · last segment ${(segMs / 1000).toFixed(2)}s`;
-        log(`  seg ${segIdx + 1}/${segments.length}: ${(segMs / 1000).toFixed(2)}s`);
-        await new Promise(resolve => requestAnimationFrame(resolve));
-    }
-    log(`Finalizing stems (divide by weightSum${normalizeExternally ? ", un-normalize" : ""})...`);
-    for (let s = 0; s < 4; s++) {
-        for (let c = 0; c < 2; c++) {
-            const stem = stems[s][c];
-            for (let i = 0; i < totalSamples; i++) {
-                const wSum = weightSum[i];
-                if (wSum > 0) stem[i] = (stem[i] / wSum) * std + mean;
-            }
-        }
-    }
-    const totalElapsed = (performance.now() - t0) / 1000;
-    const audioDuration = totalSamples / TARGET_SAMPLE_RATE;
-    const realtimeRatio = audioDuration / totalElapsed;
-    let mixErr = 0;
-    for (let i = 0; i < totalSamples; i++) {
-        const sumL = stems[0][0][i] + stems[1][0][i] + stems[2][0][i] + stems[3][0][i];
-        const sumR = stems[0][1][i] + stems[1][1][i] + stems[2][1][i] + stems[3][1][i];
-        mixErr += Math.abs(sumL - left[i]) + Math.abs(sumR - right[i]);
-    }
-    const mixMAE = mixErr / (totalSamples * 2);
-    log("");
-    log(
-        `✓ Inference complete in ${totalElapsed.toFixed(1)}s (first seg ${(firstSegMs / 1000).toFixed(2)}s, realtime ${realtimeRatio.toFixed(2)}×)`,
-    );
-    log(`  sum-of-stems vs mix MAE: ${mixMAE.toExponential(3)}`);
-    const rows = [];
-    for (let s = 0; s < 4; s++) {
-        const statsL = computeStats(stems[s][0]);
-        const statsR = computeStats(stems[s][1]);
-        log(
-            `  ${STEM_NAMES[s]}: peak L=${statsL.peak.toFixed(4)} R=${statsR.peak.toFixed(4)}, RMS L=${statsL.rms.toFixed(4)} R=${statsR.rms.toFixed(4)}`,
-        );
-        rows.push(
-            `<tr><td>${STEM_NAMES[s]}</td><td>${statsL.peak.toFixed(4)}</td><td>${statsR.peak.toFixed(4)}</td><td>${statsL.rms.toFixed(4)}</td><td>${statsR.rms.toFixed(4)}</td></tr>`,
-        );
-    }
-    resultEl.innerHTML = `
-        <table class="tensor-table">
-          <tr><th>Stem</th><th>Peak L</th><th>Peak R</th><th>RMS L</th><th>RMS R</th></tr>
-          ${rows.join("")}
-        </table>
-        <div style="margin-top: 10px; font-size: 13px; color: #155724; background: #d4edda; padding: 8px; border-radius: 4px;">
-          ✓ Separation complete — ${totalElapsed.toFixed(1)}s for ${audioDuration.toFixed(1)}s of audio (${realtimeRatio.toFixed(2)}× realtime).
-        </div>
-        <div style="margin-top: 6px; font-size: 12px; color: #666;">
-          sum-of-stems vs mix MAE: ${mixMAE.toExponential(3)} (small ≈ correct overlap-add + de-norm)
-        </div>
-      `;
-    window.__htdemucsStems = {
-        drums: { left: stems[0][0], right: stems[0][1] },
-        bass: { left: stems[1][0], right: stems[1][1] },
-        other: { left: stems[2][0], right: stems[2][1] },
-        vocals: { left: stems[3][0], right: stems[3][1] },
-        totalSamples,
-        sampleRate: TARGET_SAMPLE_RATE,
-    };
-    log(`✓ Separation complete.`);
-    renderStemResults(window.__htdemucsStems, chunks.sourceFilename);
-}
-
-// ============================================================================
-// WAV encoding, audio players, and downloads
-// ============================================================================
-
-// 32-bit float WAV (WAVE_FORMAT_IEEE_FLOAT = 3), stereo, interleaved.
-// Openable in openDAW, Reaper, Audacity, Ableton, etc.
-function encodeWavFloat32(left, right, sampleRate) {
-    const numChannels = 2;
-    const bitsPerSample = 32;
-    const bytesPerSample = bitsPerSample / 8;
-    const blockAlign = numChannels * bytesPerSample;
-    const byteRate = sampleRate * blockAlign;
-    const numFrames = left.length;
-    const dataSize = numFrames * blockAlign;
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-    let offset = 0;
-    function writeString(text) {
-        for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
-        offset += text.length;
-    }
-    function writeUint32(value) {
-        view.setUint32(offset, value, true);
-        offset += 4;
-    }
-    function writeUint16(value) {
-        view.setUint16(offset, value, true);
-        offset += 2;
-    }
-    writeString("RIFF");
-    writeUint32(36 + dataSize);
-    writeString("WAVE");
-    writeString("fmt ");
-    writeUint32(16);
-    writeUint16(3);
-    writeUint16(numChannels);
-    writeUint32(sampleRate);
-    writeUint32(byteRate);
-    writeUint16(blockAlign);
-    writeUint16(bitsPerSample);
-    writeString("data");
-    writeUint32(dataSize);
-    for (let i = 0; i < numFrames; i++) {
-        view.setFloat32(offset, left[i], true);
-        offset += 4;
-        view.setFloat32(offset, right[i], true);
-        offset += 4;
-    }
-    return new Blob([buffer], { type: "audio/wav" });
-}
-
+// Tried in this order when the backend select is "auto".
+const BACKENDS = [
+    { id: "webnn-npu", provider: "webnn", device: "npu", label: "WebNN NPU" },
+    { id: "webnn-gpu", provider: "webnn", device: "gpu", label: "WebNN GPU" },
+    { id: "webgpu", provider: "webgpu", device: "gpu", label: "WebGPU" },
+    { id: "wasm", provider: "wasm", device: "cpu", label: "WASM" },
+];
+
+const VERBOSE = getQueryValue("verbose")?.toLowerCase() === "true";
+
+const MIX_COLOR = "#3f6f9f";
 const STEM_COLORS = {
     drums: "#e74c3c",
     bass: "#9b59b6",
@@ -1509,618 +88,628 @@ const STEM_COLORS = {
     vocals: "#27ae60",
 };
 
-const stemObjectUrls = [];
+const mainElement = $(".main");
+const statusElement = $("#status");
+const backendSelect = $("#backend-select");
+const loadButton = $("#load-btn");
+const inferButton = $("#infer-btn");
+const audioFileInput = $("#audio-file");
+const inputAudio = $("#input-audio");
+const mixPlayButton = $("#mix-play-btn");
+const mixTrack = $("#mix-track");
+const stemGrid = $("#stem-grid");
+const resultsGateMessage = $("#results-gate-msg");
+const loadwaveElement = $("#stage-loadwave");
+const downloadAllButton = $("#download-all-btn");
 
-function clearStemObjectUrls() {
-    while (stemObjectUrls.length > 0) {
-        URL.revokeObjectURL(stemObjectUrls.pop());
+let session = null;
+let backendLabel = null;
+// Backend-select value the live session was created from; null when there is no usable session.
+let loadedSelection = null;
+let audioInput = null; // { left, right, totalSamples, fileName }
+const inferenceControlState = new Map();
+
+// ============================================================================
+// UI state
+// ============================================================================
+
+function updateBackendBadge(backend) {
+    const normalized = String(backend || "").toLowerCase();
+    const label = normalized.includes("npu")
+        ? "NPU"
+        : normalized.includes("gpu") || normalized === "auto"
+          ? "GPU"
+          : "CPU";
+    $("#device").textContent = label;
+    $("#badge").className = label === "NPU" ? "npu" : label === "CPU" ? "cpu" : "";
+}
+
+// Single place that derives the Load / Start buttons, badge and status from the session state.
+function updateSessionState() {
+    const hasSession = loadedSelection !== null;
+    const stale = hasSession && backendSelect.value !== loadedSelection;
+    loadButton.textContent = hasSession ? (stale ? "Reload Model" : "Model Loaded") : "Load Model";
+    loadButton.disabled = !window.ort || (hasSession && !stale);
+    loadButton.classList.toggle("attention", stale);
+    inferButton.disabled = !hasSession || stale || !audioInput;
+    if (hasSession) {
+        updateBackendBadge(backendLabel);
+        statusElement.innerHTML = stale
+            ? `Backend changed — click <strong>Reload Model</strong> to apply. Still using <strong>${backendLabel}</strong>.`
+            : `Session loaded with <strong>${backendLabel}</strong>`;
+    } else {
+        updateBackendBadge(backendSelect.value);
     }
 }
 
-function stripExtension(filename) {
-    const dot = filename.lastIndexOf(".");
-    return dot > 0 ? filename.substring(0, dot) : filename;
-}
-
-function triggerDownload(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function drawWaveform(canvas, left, right, audio, state) {
-    const context = canvas.getContext("2d");
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    const pixelRatio = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.floor(width * pixelRatio));
-    canvas.height = Math.max(1, Math.floor(height * pixelRatio));
-    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-    context.clearRect(0, 0, width, height);
-
-    const middle = height / 2;
-    const peakHeight = height * 0.42;
-    const color = canvas.dataset.color;
-    context.fillStyle = "#f5f5f5";
-    context.fillRect(0, 0, width, height);
-    context.strokeStyle = "#d9d9d9";
-    context.lineWidth = 1;
-    context.beginPath();
-    context.moveTo(0, middle + 0.5);
-    context.lineTo(width, middle + 0.5);
-    context.stroke();
-
-    context.strokeStyle = color;
-    context.globalAlpha = 0.8;
-    context.lineWidth = 1;
-    context.beginPath();
-    for (let x = 0; x < width; x++) {
-        const start = Math.floor((x * left.length) / width);
-        const end = Math.max(start + 1, Math.floor(((x + 1) * left.length) / width));
-        let minimum = 1;
-        let maximum = -1;
-        for (let index = start; index < end && index < left.length; index++) {
-            const sample = ((left[index] || 0) + (right[index] || 0)) * 0.5;
-            minimum = Math.min(minimum, sample);
-            maximum = Math.max(maximum, sample);
+function setInferenceControlsDisabled(disabled) {
+    if (disabled) {
+        for (const control of [backendSelect, loadButton, audioFileInput]) {
+            inferenceControlState.set(control, control.disabled);
+            control.disabled = true;
         }
-        context.moveTo(x + 0.5, middle + maximum * peakHeight);
-        context.lineTo(x + 0.5, middle + minimum * peakHeight);
+        return;
     }
-    context.stroke();
-    context.globalAlpha = 1;
-
-    if (audio.duration) {
-        const playheadX = Math.min(width, (audio.currentTime / audio.duration) * width);
-        context.fillStyle = "#333";
-        context.fillRect(Math.max(0, playheadX - 1), 0, 2, height);
-    }
-    state.draw = () => drawWaveform(canvas, left, right, audio, state);
+    inferenceControlState.forEach((wasDisabled, control) => {
+        control.disabled = wasDisabled;
+    });
+    inferenceControlState.clear();
 }
 
-function setupWaveform(canvas, left, right, audio, color = "#3f6f9f") {
-    canvas.dataset.color = color;
-    const state = { draw: null, animationFrame: null };
-    const resizeObserver = new ResizeObserver(() => state.draw());
-    resizeObserver.observe(canvas);
-    state.draw = () => drawWaveform(canvas, left, right, audio, state);
-
-    canvas.addEventListener("click", event => {
-        if (!audio.duration) return;
-        const bounds = canvas.getBoundingClientRect();
-        audio.currentTime = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)) * audio.duration;
-        state.draw();
-    });
-    canvas.addEventListener("pointermove", event => {
-        canvas.title = audio.duration
-            ? `${(((event.clientX - canvas.getBoundingClientRect().left) / canvas.clientWidth) * audio.duration).toFixed(1)}s`
-            : "Waveform";
-    });
-    audio.addEventListener("play", () => {
-        const animate = () => {
-            state.draw();
-            if (!audio.paused) state.animationFrame = requestAnimationFrame(animate);
-        };
-        cancelAnimationFrame(state.animationFrame);
-        animate();
-    });
-    audio.addEventListener("pause", () => {
-        cancelAnimationFrame(state.animationFrame);
-        state.draw();
-    });
-    audio.addEventListener("ended", () => {
-        cancelAnimationFrame(state.animationFrame);
-        state.draw();
-    });
-    state.draw();
+// Overall model-load progress, 0-100, drawn as the sdxl-turbo style loadwave over the Tracks stage.
+function setLoadProgress(value, label) {
+    loadwaveElement.hidden = false;
+    // Over existing tracks the overlay turns translucent, so it is clear the results are still there.
+    loadwaveElement.classList.toggle("over-tracks", !mixTrack.hidden);
+    loadwaveElement.style.setProperty("--loadwave-value", value);
+    $("#loadwave-value").textContent = Math.round(value);
+    if (label !== undefined) $("#loadwave-label").textContent = label;
 }
 
-function renderStemResults(stems, sourceFilename) {
-    clearStemObjectUrls();
-    const grid = document.getElementById("stem-grid");
-    grid.innerHTML = "";
-    const baseName = stripExtension(sourceFilename || "audio");
-    const blobs = {};
-    log("");
-    log("=== ENCODING WAV FILES ===");
-    for (const name of STEM_NAMES) {
-        const tEnc = performance.now();
-        const stem = stems[name];
-        const blob = encodeWavFloat32(stem.left, stem.right, stems.sampleRate);
-        const encMs = performance.now() - tEnc;
-        blobs[name] = blob;
-        const url = URL.createObjectURL(blob);
-        stemObjectUrls.push(url);
-        log(`  ${name}: ${(blob.size / 1048576).toFixed(1)} MB encoded in ${encMs.toFixed(0)}ms`);
-        const tile = document.createElement("div");
-        tile.style.cssText = "border: 1px solid #e0e0e0; border-radius: 6px; padding: 12px; background: #fafafa;";
-        tile.innerHTML = `
-          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
-            <div style="font-weight: 600; color: ${STEM_COLORS[name]}; text-transform: uppercase; letter-spacing: 0.5px; font-size: 13px;">${name}</div>
-            <div style="font-size: 11px; color: #888; font-family: 'Consolas', monospace;">${(blob.size / 1048576).toFixed(1)} MB</div>
-          </div>
-          <canvas class="stem-waveform" data-color="${STEM_COLORS[name]}" aria-label="${name} waveform" style="display: block; width: 100%; height: 96px; margin-bottom: 8px; border: 1px solid #e0e0e0; cursor: pointer;"></canvas>
-          <audio controls preload="metadata" style="width: 100%; margin-bottom: 8px;" src="${url}"></audio>
-          <button class="stem-download-btn" data-stem="${name}" style="width: 100%;">Download ${baseName}.${name}.wav</button>
-        `;
-        grid.appendChild(tile);
-        setupWaveform(
-            tile.querySelector(".stem-waveform"),
-            stem.left,
-            stem.right,
-            tile.querySelector("audio"),
-            STEM_COLORS[name],
+function hideLoadProgress() {
+    loadwaveElement.hidden = true;
+}
+
+function showStageMessage(text) {
+    $("#stage-msg").textContent = text;
+    $("#stage-empty").hidden = false;
+}
+
+function showErrorBadge(element, message) {
+    const badge = document.createElement("span");
+    badge.className = "badge badge-error";
+    badge.textContent = `Failed: ${message}`;
+    element.replaceChildren(badge);
+}
+
+const checkWebNN = async () => {
+    const status = $("#webnnstatus");
+    const info = $("#info");
+    const webnnStatus = await getWebnnStatus();
+
+    if (webnnStatus.webnn) {
+        status.setAttribute("class", "green");
+        info.innerHTML = `WebNN supported · <a href="./?devicetype=gpu">GPU</a> · <a href="./?devicetype=npu">NPU</a>`;
+    } else {
+        status.setAttribute("class", "red");
+        const reason = webnnStatus.error ? `WebNN not supported: ${webnnStatus.error}` : "WebNN not supported";
+        info.innerHTML = `${reason} <a id="webnn_na" href="../../install.html" title="WebNN Installation Guide">Set up WebNN</a>`;
+        logError(`[Error] ${reason}`);
+    }
+};
+
+// ============================================================================
+// Model loading and session creation
+// ============================================================================
+
+// `progressRange` is the [from, to] slice of the overall load progress this file fills.
+async function loadModelFile(host, file, label, progressRange) {
+    const [from, to] = progressRange;
+    const opfsPath = `models/${MODEL.name}/${file}`;
+    const cached = await readFromOPFS(opfsPath);
+    if (cached) {
+        log(`[Load] ${file} loaded from OPFS cache · ${toMegabytes(cached.byteLength)} MB`);
+        setLoadProgress(to, `Loaded ${label} from cache`);
+        return cached;
+    }
+    const buffer = await downloadWithProgress(`${host}/${file}`, (receivedBytes, totalBytes) => {
+        setLoadProgress(
+            from + ((to - from) * receivedBytes) / totalBytes,
+            `Downloading ${label} · ${toMegabytes(receivedBytes)} / ${toMegabytes(totalBytes)} MB`,
         );
+    });
+    setLoadProgress(to);
+    const savedToCache = await writeToOPFS(opfsPath, buffer);
+    log(
+        `[Load] ${file} downloaded from ${host}${savedToCache ? ", cached to OPFS" : ""} · ${toMegabytes(buffer.byteLength)} MB`,
+    );
+    return buffer;
+}
+
+async function loadModelBuffers() {
+    let host = MODEL.host;
+    if (host.includes("huggingface.co")) {
+        host = host.replace("huggingface.co", await getHuggingFaceDomain());
     }
-    for (const btn of grid.querySelectorAll(".stem-download-btn")) {
-        btn.addEventListener("click", () => {
-            const name = btn.dataset.stem;
-            triggerDownload(blobs[name], `${baseName}.${name}.wav`);
+    const fetchFile = (file, label, progressRange) =>
+        WebNNPerf.time("webnn.model.fetch", () => loadModelFile(host, file, label, progressRange), { model: file });
+    const graph = await fetchFile(MODEL.file, "model graph", [0, 5]);
+    const weights = await fetchFile(MODEL.externalData, "weights", [5, 85]);
+    return { graph, weights };
+}
+
+async function detectAvailableBackends() {
+    const available = new Set(["wasm"]);
+    if ("ml" in navigator) {
+        for (const device of ["npu", "gpu"]) {
+            try {
+                await navigator.ml.createContext({ deviceType: device });
+                available.add(`webnn-${device}`);
+            } catch {
+                // device not supported
+            }
+        }
+    }
+    if ("gpu" in navigator) {
+        try {
+            if (await navigator.gpu.requestAdapter()) available.add("webgpu");
+        } catch {
+            // WebGPU not supported
+        }
+    }
+    return available;
+}
+
+async function createSession({ graph, weights }, availableBackends, selection) {
+    const candidates = selection === "auto" ? BACKENDS : BACKENDS.filter(backend => backend.id === selection);
+    if (candidates.length === 0) {
+        throw new Error(`Backend "${selection}" not found`);
+    }
+    for (const backend of candidates) {
+        if (!availableBackends.has(backend.id)) {
+            log(`[Session Create] ${backend.label} unavailable, skipped`);
+            continue;
+        }
+        try {
+            log(`[Session Create] Beginning ${MODEL.name} with ${backend.label}`);
+            WebNNPerf.configure({ model: MODEL.name, device: backend.device, provider: backend.provider });
+            const executionProvider = { name: backend.provider };
+            if (backend.provider === "webnn") {
+                executionProvider.deviceType = backend.device;
+                executionProvider.context = await WebNNPerf.time("webnn.context.create", () =>
+                    navigator.ml.createContext({ deviceType: backend.device }),
+                );
+            }
+            const sessionOptions = {
+                executionProviders: [executionProvider],
+                logSeverityLevel: VERBOSE ? 0 : 3, // 0: verbose, 1: info, 2: warning, 3: error
+                externalData: [{ data: weights, path: MODEL.externalData }],
+            };
+            const start = performance.now();
+            const createdSession = await WebNNPerf.time(
+                "webnn.session.create",
+                () => ort.InferenceSession.create(graph, sessionOptions),
+                { model: MODEL.name },
+            );
+            const sessionCreationTime = (performance.now() - start).toFixed(2);
+            log(`[Session Create] Create ${MODEL.name} with ${backend.label} completed · ${sessionCreationTime}ms`);
+            return { createdSession, backend };
+        } catch (error) {
+            log(`[Session Create] ${backend.label} failed: ${error.message}`);
+        }
+    }
+    throw new Error("All backends failed");
+}
+
+async function loadModel() {
+    loadButton.disabled = true;
+    backendSelect.disabled = true;
+    inferButton.disabled = true;
+    // The overlay covers the tracks, so nothing underneath should keep playing.
+    mixerPause();
+    inputAudio.pause();
+    mainElement.classList.add("busy");
+    statusElement.textContent = "Loading...";
+    setLoadProgress(0, "Preparing…");
+
+    try {
+        if (session) {
+            // Freed before the new compile so two copies never sit on the NPU/GPU at once.
+            const previousSession = session;
+            session = null;
+            loadedSelection = null;
+            await previousSession.release?.();
+            log(`[Load] Released previous ${backendLabel} session`);
+        }
+
+        const availableBackends = await detectAvailableBackends();
+        const availableLabels = BACKENDS.filter(backend => availableBackends.has(backend.id)).map(
+            backend => backend.label,
+        );
+        log(`[Load] Available backends: ${availableLabels.join(", ")}`);
+        log(`[Load] Loading model ${MODEL.name} · ${MODEL.size}`);
+        const modelBuffers = await loadModelBuffers();
+
+        const selection = backendSelect.value;
+        updateBackendBadge(selection);
+        setLoadProgress(90, `Compiling for ${backendSelect.selectedOptions[0].textContent}…`);
+        const { createdSession, backend } = await createSession(modelBuffers, availableBackends, selection);
+        session = createdSession;
+        backendLabel = backend.label;
+        loadedSelection = selection;
+
+        log("[Session Create] Ready to separate audio");
+        audioFileInput.disabled = false;
+        if (mixTrack.hidden) showStageMessage("Model ready — upload an audio file to begin.");
+        setLoadProgress(100);
+        updateSessionState();
+    } catch (error) {
+        logError(`[Load] failed, ${error.message}`);
+        updateSessionState();
+        showErrorBadge(statusElement, error.message);
+        if (!session) $("#device").textContent = "—";
+        if (mixTrack.hidden) showStageMessage("Model failed to load — see the log for details.");
+    } finally {
+        hideLoadProgress();
+        mainElement.classList.remove("busy");
+        backendSelect.disabled = false;
+        if (!session) loadButton.disabled = false;
+    }
+}
+
+// ============================================================================
+// Audio input
+// ============================================================================
+
+function formatSampleCount(sampleCount) {
+    return `${sampleCount.toLocaleString()} samples (${(sampleCount / SAMPLE_RATE).toFixed(2)}s)`;
+}
+
+// Stems from the previous run or file are stale the moment a new one starts: stop the mixer
+// and clear them, so nothing keeps playing underneath and no mismatched results stay visible.
+function clearStemResults() {
+    resetStemMixer();
+    stemGrid.innerHTML = "";
+    $("#stem-stats").innerHTML = "";
+    resultsGateMessage.hidden = mixTrack.hidden;
+}
+
+async function handleAudioFile(file) {
+    const audioInfo = $("#audio-info");
+    audioInfo.innerHTML = "";
+    mixTrack.hidden = true;
+    $("#track-file").textContent = file.name;
+    showStageMessage("Decoding…");
+    clearStemResults();
+
+    log(`[Audio] Loading ${file.name} · ${toMegabytes(file.size)} MB`);
+    const decoded = await decodeAudioFile(file);
+    log(
+        `[Audio] Decoded · ${decoded.sampleRate} Hz · ${decoded.numberOfChannels} ch · ${decoded.duration.toFixed(2)}s`,
+    );
+    showStageMessage("Resampling…");
+    const resampled = await resampleAudioBuffer(decoded, SAMPLE_RATE);
+    if (resampled !== decoded) log(`[Audio] Resampled to ${SAMPLE_RATE} Hz`);
+    const { left, right, droppedChannels } = toStereo(resampled);
+    if (droppedChannels > 0) {
+        log(`[Audio] Using the first 2 of ${resampled.numberOfChannels} channels`);
+    } else if (resampled.numberOfChannels === 1) {
+        log("[Audio] Mono duplicated to stereo");
+    }
+    const totalSamples = left.length;
+    const segmentLayout = getSegmentLayout(totalSamples);
+    log(
+        `[Audio] ${segmentLayout.count} segments · hop ${HOP} · last segment padded by ${segmentLayout.lastPadding.toLocaleString()} samples`,
+    );
+
+    inputAudio.pause();
+    inputAudio.src = URL.createObjectURL(file);
+    // A fresh canvas drops the previous file's waveform listeners.
+    const previousWaveform = $("#input-waveform");
+    const inputWaveform = previousWaveform.cloneNode(false);
+    previousWaveform.replaceWith(inputWaveform);
+    $("#stage-empty").hidden = true;
+    mixTrack.hidden = false;
+    resultsGateMessage.hidden = false;
+    setupWaveform(inputWaveform, left, right, inputAudio, MIX_COLOR);
+    audioInfo.innerHTML = `
+        <details class="audio-details">
+          <summary>Audio details</summary>
+          <table class="tensor-table">
+            <tr><th>Source</th><td>${decoded.sampleRate} Hz · ${decoded.numberOfChannels} ch · ${decoded.duration.toFixed(2)}s</td></tr>
+            <tr><th>Resampled</th><td>${resampled === decoded ? "(not needed)" : `${SAMPLE_RATE} Hz · ${formatSampleCount(resampled.length)}`}</td></tr>
+            <tr><th>Total samples @ 44.1kHz</th><td>${formatSampleCount(totalSamples)}</td></tr>
+            <tr><th>Segments</th><td>${segmentLayout.count} × ${SEGMENT_LENGTH} samples (hop ${HOP}, overlap ${SEGMENT_LENGTH - HOP})</td></tr>
+            <tr><th>Last segment padding</th><td>${segmentLayout.lastPadding.toLocaleString()} samples</td></tr>
+          </table>
+        </details>
+      `;
+    audioInput = { left, right, totalSamples, fileName: file.name };
+    updateSessionState();
+}
+
+// ============================================================================
+// Separation
+// ============================================================================
+
+async function runInference() {
+    if (!session) throw new Error("Session not loaded — load the model first");
+    if (!audioInput) throw new Error("No audio loaded — choose an audio file first");
+    const { left, right, totalSamples, fileName } = audioInput;
+    const progressFill = $("#infer-progress-fill");
+    const progressLabel = $("#infer-progress-label");
+    const etaElement = $("#infer-eta");
+    const resultElement = $("#infer-result");
+    $("#infer-progress-container").style.display = "block";
+    progressFill.style.width = "0%";
+    progressLabel.textContent = "0%";
+    etaElement.textContent = "";
+    resultElement.innerHTML = "";
+    clearStemResults();
+
+    const segmentCount = getSegmentLayout(totalSamples).count;
+    const weights = buildOverlapWeights();
+    // Preallocated, so the tiles can be built before any segment runs; the loop fills them in place.
+    const stems = createStemBuffers(totalSamples);
+    const weightTotals = new Float32Array(totalSamples);
+    // Nothing above has awaited, so this is still the click task and the AudioContext may start.
+    renderStemShells(stems, totalSamples, fileName);
+    const leadSeconds = (STREAM_LEAD_HOPS * HOP) / SAMPLE_RATE;
+    log(`[Session Run] Beginning ${segmentCount} segments, playback starts after ${leadSeconds.toFixed(1)}s of audio`);
+
+    let frontier = 0; // samples finalized and handed to the mixer
+    let inferenceMs = 0; // per-segment time only, so backends compare without streaming overhead
+    let streamingMs = 0;
+    let firstSegmentMs = 0;
+    const startTime = performance.now();
+    for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex++) {
+        const segment = extractSegment(left, right, segmentIndex);
+        const segmentStart = performance.now();
+        const { spectrogram, waveform, spectrogramStats, waveformStats } = htdemucsPreForward(segment);
+        const inputs = {
+            x: new ort.Tensor("float32", spectrogram, SPECTROGRAM_SHAPE),
+            xt: new ort.Tensor("float32", waveform, WAVEFORM_SHAPE),
+        };
+        const outputs = await WebNNPerf.time("webnn.inference", () => session.run(inputs), {
+            model: MODEL.name,
+            iteration: segmentIndex + 1,
         });
+        const sources = htdemucsPostForward(outputs.x_out.data, outputs.xt_out.data, spectrogramStats, waveformStats);
+        const segmentMs = performance.now() - segmentStart;
+        if (segmentIndex === 0) firstSegmentMs = segmentMs;
+        inferenceMs += segmentMs;
+        addSegmentToStems(stems, weightTotals, sources, weights, segmentIndex * HOP);
+        for (const tensor of [...Object.values(inputs), ...Object.values(outputs)]) tensor.dispose?.();
+
+        const streamingStart = performance.now();
+        // The last segment has no successor, so it closes out the tail in one jump.
+        const newFrontier =
+            segmentIndex === segmentCount - 1 ? totalSamples : Math.min((segmentIndex + 1) * HOP, totalSamples);
+        if (newFrontier > frontier) {
+            finalizeStemRange(stems, weightTotals, frontier, newFrontier);
+            const wallSeconds = (performance.now() - startTime) / 1000;
+            stemMixer.streamRatio = wallSeconds > 0 ? newFrontier / SAMPLE_RATE / wallSeconds : 0;
+            publishStemRegion(stems, frontier, newFrontier);
+            frontier = newFrontier;
+        }
+        streamingMs += performance.now() - streamingStart;
+
+        const elapsedSeconds = (performance.now() - startTime) / 1000;
+        const remainingSeconds = (elapsedSeconds / (segmentIndex + 1)) * (segmentCount - segmentIndex - 1);
+        progressFill.style.width = `${((segmentIndex + 1) / segmentCount) * 100}%`;
+        progressLabel.textContent = `${segmentIndex + 1} / ${segmentCount}`;
+        etaElement.textContent = `Elapsed ${elapsedSeconds.toFixed(1)}s · est. remaining ${remainingSeconds.toFixed(1)}s · last segment ${(segmentMs / 1000).toFixed(2)}s`;
+        log(`[Session Run] Segment ${segmentIndex + 1}/${segmentCount} · ${segmentMs.toFixed(2)}ms`);
+        await new Promise(resolve => requestAnimationFrame(resolve));
     }
-    const downloadAllBtn = document.getElementById("download-all-btn");
-    downloadAllBtn.onclick = async () => {
+
+    const wallSeconds = (performance.now() - startTime) / 1000;
+    const inferenceSeconds = inferenceMs / 1000;
+    const streamingSeconds = streamingMs / 1000;
+    const audioSeconds = totalSamples / SAMPLE_RATE;
+    const realtimeRatio = audioSeconds / wallSeconds;
+    const inferenceRatio = audioSeconds / inferenceSeconds;
+    log(
+        `[Session Run] Separation completed · ${wallSeconds.toFixed(1)}s (${realtimeRatio.toFixed(2)}× realtime), first segment ${(firstSegmentMs / 1000).toFixed(2)}s`,
+    );
+    log(
+        `[Session Run] Pure inference ${inferenceSeconds.toFixed(1)}s (${inferenceRatio.toFixed(2)}× realtime) · streaming overhead ${streamingSeconds.toFixed(2)}s`,
+    );
+    resultElement.innerHTML = `
+        <span class="result-ok">✓ Separated in ${wallSeconds.toFixed(1)}s · ${realtimeRatio.toFixed(2)}× realtime · ${backendLabel}</span>
+        <span class="result-sub">pure inference ${inferenceSeconds.toFixed(1)}s (${inferenceRatio.toFixed(2)}×) · streaming overhead ${streamingSeconds.toFixed(2)}s</span>
+      `;
+    showStemStatistics(stems, left, right);
+    finalizeStemResults(stems, fileName);
+}
+
+function showStemStatistics(stems, left, right) {
+    const rows = STEM_NAMES.map(name => {
+        const leftLevels = computeLevels(stems[name].left);
+        const rightLevels = computeLevels(stems[name].right);
+        const cells = [leftLevels.peak, rightLevels.peak, leftLevels.rms, rightLevels.rms]
+            .map(value => `<td>${value.toFixed(4)}</td>`)
+            .join("");
+        return `<tr><td>${name}</td>${cells}</tr>`;
+    });
+    $("#stem-stats").innerHTML = `
+        <details class="audio-details">
+          <summary>Stem statistics</summary>
+          <table class="tensor-table">
+            <tr><th>Stem</th><th>Peak L</th><th>Peak R</th><th>RMS L</th><th>RMS R</th></tr>
+            ${rows.join("")}
+          </table>
+          <div class="result-note">
+            sum-of-stems vs mix MAE: ${computeMixError(stems, left, right).toExponential(3)} (small ≈ correct overlap-add)
+          </div>
+        </details>
+      `;
+}
+
+// ============================================================================
+// Stem tracks
+// ============================================================================
+
+// Tiles, waveforms, mute / solo and the audio graph: everything that does not need finished audio.
+function renderStemShells(stems, totalSamples, fileName) {
+    startStemMixer(totalSamples);
+    const baseName = stripExtension(fileName);
+    downloadAllButton.disabled = true;
+    downloadAllButton.onclick = null;
+
+    for (const name of STEM_NAMES) {
+        const tile = document.createElement("div");
+        tile.className = "track";
+        tile.innerHTML = `
+          <div class="track-head">
+            <div class="track-name" style="color: ${STEM_COLORS[name]};">${name}</div>
+            <div class="stem-toggles">
+              <button class="stem-toggle mute" aria-pressed="false" title="Mute ${name}">M</button>
+              <button class="stem-toggle solo" aria-pressed="false" title="Solo ${name}">S</button>
+            </div>
+          </div>
+          <canvas class="track-waveform" aria-label="${name} waveform"></canvas>
+          <div class="track-tail">
+            <button class="icon-btn small stem-download-btn" disabled>
+              <svg viewBox="0 -960 960 960"><path d="M480-320 280-520l56-58 104 104v-326h80v326l104-104 56 58-200 200ZM240-160q-33 0-56.5-23.5T160-240v-120h80v120h480v-120h80v120q0 33-23.5 56.5T720-160H240Z" /></svg>
+            </button>
+            <div class="stem-size">—</div>
+          </div>
+        `;
+        stemGrid.appendChild(tile);
+        const canvas = tile.querySelector(".track-waveform");
+        const waveformState = setupWaveform(
+            canvas,
+            stems[name].left,
+            stems[name].right,
+            stemTransport,
+            STEM_COLORS[name],
+            () => (stemMixer.streaming ? stemMixer.frontierSamples : stemMixer.totalSamples),
+        );
+        const muteButton = tile.querySelector(".stem-toggle.mute");
+        const soloButton = tile.querySelector(".stem-toggle.solo");
+        const downloadButton = tile.querySelector(".stem-download-btn");
+        downloadButton.title = `Separating ${baseName}.${name}.wav…`;
+        muteButton.addEventListener("click", () => toggleStemMute(name));
+        soloButton.addEventListener("click", () => toggleStemSolo(name));
+        stemMixer.tiles[name] = {
+            muteButton,
+            soloButton,
+            canvas,
+            sizeElement: tile.querySelector(".stem-size"),
+            downloadButton,
+            redraw: () => waveformState.draw(),
+        };
+    }
+    resultsGateMessage.hidden = true;
+    updateTransportUi();
+    updateStemTileStates();
+}
+
+// Encodes the WAVs and enables downloads. Clearing `streaming` lifts the seek clamp and drops the frontier marker.
+function finalizeStemResults(stems, fileName) {
+    const baseName = stripExtension(fileName);
+    const blobs = {};
+    stemMixer.streaming = false;
+    const encodeStart = performance.now();
+    for (const name of STEM_NAMES) {
+        blobs[name] = encodeWavFloat32(stems[name].left, stems[name].right, SAMPLE_RATE);
+        const tile = stemMixer.tiles[name];
+        tile.sizeElement.textContent = `${toMegabytes(blobs[name].size)} MB`;
+        tile.downloadButton.disabled = false;
+        tile.downloadButton.title = `Download ${baseName}.${name}.wav`;
+        tile.downloadButton.onclick = () => triggerDownload(blobs[name], `${baseName}.${name}.wav`);
+        tile.redraw();
+    }
+    const encodeTime = (performance.now() - encodeStart).toFixed(2);
+    log(
+        `[Encode] ${STEM_NAMES.length} stems encoded to WAV · ${toMegabytes(blobs.drums.size)} MB each · ${encodeTime}ms`,
+    );
+    downloadAllButton.disabled = false;
+    downloadAllButton.onclick = async () => {
         for (const name of STEM_NAMES) {
             triggerDownload(blobs[name], `${baseName}.${name}.wav`);
             await new Promise(resolve => setTimeout(resolve, 300));
         }
     };
-    document.getElementById("results-gate-msg").style.display = "none";
-    document.getElementById("results-controls").style.display = "block";
-    window.__htdemucsStemBlobs = blobs;
-    log(`✓ Stem audio is ready.`);
+    updateTransportUi();
 }
 
 // ============================================================================
-// Reference comparison helpers retained for local development.
+// Initialization and event handlers
 // ============================================================================
 
-async function fetchFloat32(path) {
-    const response = await fetch(path, { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${path}`);
-    const buffer = await response.arrayBuffer();
-    return new Float32Array(buffer);
-}
-
-function compareFloat32(jsArr, refArr, label) {
-    if (jsArr.length !== refArr.length) {
-        return { ok: false, reason: `length mismatch: js=${jsArr.length}, ref=${refArr.length}`, label };
-    }
-    let maxDiff = 0;
-    let maxDiffIdx = -1;
-    let sumDiff = 0;
-    for (let i = 0; i < jsArr.length; i++) {
-        const diff = Math.abs(jsArr[i] - refArr[i]);
-        sumDiff += diff;
-        if (diff > maxDiff) {
-            maxDiff = diff;
-            maxDiffIdx = i;
-        }
-    }
-    const mae = sumDiff / jsArr.length;
-    return {
-        ok: maxDiff < 1e-4,
-        maxDiff,
-        maxDiffIdx,
-        mae,
-        jsAtMax: jsArr[maxDiffIdx],
-        refAtMax: refArr[maxDiffIdx],
-        label,
-    };
-}
-
-function formatChannelSamples(arr, channelOffset, freqBins, timeFrames) {
-    const firstFive = [];
-    for (let i = 0; i < 5; i++) firstFive.push(arr[channelOffset + i].toExponential(3));
-    const f0t0 = arr[channelOffset + 0 * timeFrames + 0];
-    const f1t0 = arr[channelOffset + 1 * timeFrames + 0];
-    const f100t50 = arr[channelOffset + 100 * timeFrames + 50];
-    const f1000t100 = arr[channelOffset + 1000 * timeFrames + 100];
-    const f2047t335 = arr[channelOffset + 2047 * timeFrames + 335];
-    return { firstFive, f0t0, f1t0, f100t50, f1000t100, f2047t335 };
-}
-
-async function runStftValidation() {
-    const resultEl = document.getElementById("stft-validate-result");
-    resultEl.innerHTML = "<em>Fetching reference files...</em>";
-    log("");
-    log("=== STFT VALIDATION ===");
-    const input = await fetchFloat32("./reference/input.f32");
-    const ref = await fetchFloat32("./reference/x_ref.f32");
-    log(`  loaded input.f32 (${input.length} floats = ${input.length / 343980} channels)`);
-    log(`  loaded x_ref.f32 (${ref.length} floats, expected ${1 * 4 * 2048 * 336})`);
-    if (input.length !== 2 * 343980) throw new Error(`input.f32 wrong size: ${input.length}`);
-    if (ref.length !== 1 * 4 * 2048 * 336) throw new Error(`x_ref.f32 wrong size: ${ref.length}`);
-
-    // input.f32 is [2, 343980] planar (L then R). Our STFT expects the same planar layout
-    // inside a single Float32Array of length 2 * SEGMENT_LENGTH = 2 * 343980 = 687960.
-    if (input.length !== 2 * SEGMENT_LENGTH) throw new Error(`SEGMENT_LENGTH mismatch`);
-
-    const jsX = new Float32Array(1 * 4 * 2048 * 336);
-    const tStft = performance.now();
-    buildSpectrogramInput(input, jsX);
-    const stftMs = performance.now() - tStft;
-    log(`  JS STFT built in ${stftMs.toFixed(0)}ms`);
-
-    // Overall comparison
-    const overall = compareFloat32(jsX, ref, "overall");
-    log(
-        `  overall: maxDiff=${overall.maxDiff.toExponential(3)} @ idx ${overall.maxDiffIdx}, MAE=${overall.mae.toExponential(3)}`,
-    );
-
-    // Per-channel comparison
-    const FREQ = 2048;
-    const TIME = 336;
-    const CHAN = FREQ * TIME;
-    const channelNames = ["real_L", "imag_L", "real_R", "imag_R"];
-    const perChannel = [];
-    for (let c = 0; c < 4; c++) {
-        const jsSlice = jsX.subarray(c * CHAN, (c + 1) * CHAN);
-        const refSlice = ref.subarray(c * CHAN, (c + 1) * CHAN);
-        const cmp = compareFloat32(jsSlice, refSlice, channelNames[c]);
-        const jsSamples = formatChannelSamples(jsX, c * CHAN, FREQ, TIME);
-        const refSamples = formatChannelSamples(ref, c * CHAN, FREQ, TIME);
-        perChannel.push({ name: channelNames[c], cmp, jsSamples, refSamples });
-        log(`  ${channelNames[c]}: maxDiff=${cmp.maxDiff.toExponential(3)}, MAE=${cmp.mae.toExponential(3)}`);
-        log(
-            `    JS  f0_t0=${jsSamples.f0t0.toExponential(3)}, f100_t50=${jsSamples.f100t50.toExponential(3)}, f1000_t100=${jsSamples.f1000t100.toExponential(3)}`,
-        );
-        log(
-            `    REF f0_t0=${refSamples.f0t0.toExponential(3)}, f100_t50=${refSamples.f100t50.toExponential(3)}, f1000_t100=${refSamples.f1000t100.toExponential(3)}`,
-        );
-    }
-
-    const pass = overall.maxDiff < 1e-4;
-    log(
-        pass
-            ? `✓ STFT VALIDATION PASSED (maxDiff < 1e-4)`
-            : `✗ STFT VALIDATION FAILED (maxDiff = ${overall.maxDiff.toExponential(3)})`,
-    );
-
-    let html = `
-        <div style="padding: 10px; border-radius: 6px; background: ${pass ? "#d4edda" : "#f8d7da"}; color: ${pass ? "#155724" : "#721c24"}; font-weight: 600; margin-bottom: 12px;">
-          ${pass ? "✓ PASS" : "✗ FAIL"} — overall maxDiff=${overall.maxDiff.toExponential(3)}, MAE=${overall.mae.toExponential(3)}
-        </div>
-        <table class="tensor-table">
-          <tr><th>Channel</th><th>maxDiff</th><th>MAE</th><th>JS f0_t0</th><th>REF f0_t0</th><th>JS f1000_t100</th><th>REF f1000_t100</th></tr>
-      `;
-    for (const entry of perChannel) {
-        html += `<tr>
-          <td>${entry.name}</td>
-          <td>${entry.cmp.maxDiff.toExponential(3)}</td>
-          <td>${entry.cmp.mae.toExponential(3)}</td>
-          <td>${entry.jsSamples.f0t0.toExponential(3)}</td>
-          <td>${entry.refSamples.f0t0.toExponential(3)}</td>
-          <td>${entry.jsSamples.f1000t100.toExponential(3)}</td>
-          <td>${entry.refSamples.f1000t100.toExponential(3)}</td>
-        </tr>`;
-    }
-    html += "</table>";
-    resultEl.innerHTML = html;
-}
-
-async function runPreForwardValidation() {
-    const resultEl = document.getElementById("pre-validate-result");
-    resultEl.innerHTML = "<em>Fetching reference files...</em>";
-    log("");
-    log("=== pre_forward VALIDATION ===");
-    const input = await fetchFloat32("./reference/input.f32");
-    const prepXRef = await fetchFloat32("./reference/prepped_x.f32");
-    const prepXtRef = await fetchFloat32("./reference/prepped_xt.f32");
-    const normStats = await fetchFloat32("./reference/norm_stats.f32");
-    const refStd = normStats[0];
-    const refMean = normStats[1];
-    const refMeant = normStats[2];
-    const refStdt = normStats[3];
-    log(
-        `  refs: std=${refStd.toExponential(3)}, mean=${refMean.toExponential(3)}, meant=${refMeant.toExponential(3)}, stdt=${refStdt.toExponential(3)}`,
-    );
-
-    const { xBuf, xtBuf, mean, std, meant, stdt } = htdemucsPreForward(input);
-    log(
-        `  JS:   std=${std.toExponential(3)}, mean=${mean.toExponential(3)}, meant=${meant.toExponential(3)}, stdt=${stdt.toExponential(3)}`,
-    );
-
-    const xCmp = compareFloat32(xBuf, prepXRef, "prepped_x");
-    const xtCmp = compareFloat32(xtBuf, prepXtRef, "prepped_xt");
-    log(`  prepped_x:  maxDiff=${xCmp.maxDiff.toExponential(3)}, MAE=${xCmp.mae.toExponential(3)}`);
-    log(`  prepped_xt: maxDiff=${xtCmp.maxDiff.toExponential(3)}, MAE=${xtCmp.mae.toExponential(3)}`);
-
-    const diffs = {
-        std: Math.abs(std - refStd),
-        mean: Math.abs(mean - refMean),
-        meant: Math.abs(meant - refMeant),
-        stdt: Math.abs(stdt - refStdt),
-    };
-    log(
-        `  stat diffs: std=${diffs.std.toExponential(3)}, mean=${diffs.mean.toExponential(3)}, meant=${diffs.meant.toExponential(3)}, stdt=${diffs.stdt.toExponential(3)}`,
-    );
-
-    const pass = xCmp.maxDiff < 1e-4 && xtCmp.maxDiff < 1e-4;
-    log(pass ? `✓ pre_forward VALIDATION PASSED` : `✗ pre_forward VALIDATION FAILED`);
-
-    resultEl.innerHTML = `
-        <div style="padding: 10px; border-radius: 6px; background: ${pass ? "#d4edda" : "#f8d7da"}; color: ${pass ? "#155724" : "#721c24"}; font-weight: 600; margin-bottom: 12px;">
-          ${pass ? "✓ PASS" : "✗ FAIL"} — prepped_x maxDiff=${xCmp.maxDiff.toExponential(3)}, prepped_xt maxDiff=${xtCmp.maxDiff.toExponential(3)}
-        </div>
-        <table class="tensor-table">
-          <tr><th>Tensor</th><th>maxDiff</th><th>MAE</th><th>JS stat</th><th>REF stat</th><th>|diff|</th></tr>
-          <tr><td>prepped_x</td><td>${xCmp.maxDiff.toExponential(3)}</td><td>${xCmp.mae.toExponential(3)}</td><td>std=${std.toExponential(3)}, mean=${mean.toExponential(3)}</td><td>std=${refStd.toExponential(3)}, mean=${refMean.toExponential(3)}</td><td>std:${diffs.std.toExponential(3)} mean:${diffs.mean.toExponential(3)}</td></tr>
-          <tr><td>prepped_xt</td><td>${xtCmp.maxDiff.toExponential(3)}</td><td>${xtCmp.mae.toExponential(3)}</td><td>stdt=${stdt.toExponential(3)}, meant=${meant.toExponential(3)}</td><td>stdt=${refStdt.toExponential(3)}, meant=${refMeant.toExponential(3)}</td><td>stdt:${diffs.stdt.toExponential(3)} meant:${diffs.meant.toExponential(3)}</td></tr>
-        </table>
-      `;
-}
-
-async function runModelValidation() {
-    const resultEl = document.getElementById("model-validate-result");
-    const session = window.__htdemucsSession;
-    const modelConfig = window.__htdemucsModelConfig;
-    if (!session) {
-        resultEl.innerHTML = '<span class="badge badge-error">Load model in Phase 1 first.</span>';
-        return;
-    }
-    resultEl.innerHTML = "<em>Fetching reference files...</em>";
-    log("");
-    log(`=== MODEL fwd VALIDATION (JS vs Python CPU, model=${modelConfig.label}) ===`);
-
-    if (modelConfig.fwdOnly) {
-        // For our Intel-style fwd-only export: feed Python-reference prepped_x, prepped_xt;
-        // compare against fwd_xout, fwd_xtout.
-        const prepX = await fetchFloat32("./reference/prepped_x.f32");
-        const prepXt = await fetchFloat32("./reference/prepped_xt.f32");
-        const xOutRef = await fetchFloat32("./reference/fwd_xout.f32");
-        const xtOutRef = await fetchFloat32("./reference/fwd_xtout.f32");
-        log(`  loaded prepped_x, prepped_xt, fwd_xout, fwd_xtout`);
-        if (prepX.length !== 1 * 4 * 2048 * 336) throw new Error(`prepped_x size: ${prepX.length}`);
-        if (prepXt.length !== 1 * 2 * 343980) throw new Error(`prepped_xt size: ${prepXt.length}`);
-        if (xOutRef.length !== 1 * 16 * 2048 * 336) throw new Error(`fwd_xout size: ${xOutRef.length}`);
-        if (xtOutRef.length !== 1 * 8 * 343980) throw new Error(`fwd_xtout size: ${xtOutRef.length}`);
-
-        const xTensor = new ort.Tensor("float32", prepX, [1, 4, 2048, 336]);
-        const xtTensor = new ort.Tensor("float32", prepXt, [1, 2, 343980]);
-        const feeds = { x: xTensor, xt: xtTensor };
-        log(`  running session.run with prepped reference tensors...`);
-        const tRun = performance.now();
-        const outputs = await session.run(feeds);
-        const runMs = performance.now() - tRun;
-        log(`  session.run finished in ${runMs.toFixed(0)}ms`);
-        const xOut = outputs["x_out"];
-        const xtOut = outputs["xt_out"];
-        if (!xOut || !xtOut) throw new Error("expected x_out and xt_out outputs");
-        log(`  JS x_out  shape=[${xOut.dims.join(",")}], length=${xOut.data.length}`);
-        log(`  JS xt_out shape=[${xtOut.dims.join(",")}], length=${xtOut.data.length}`);
-
-        const xCmp = compareFloat32(xOut.data, xOutRef, "x_out");
-        const xtCmp = compareFloat32(xtOut.data, xtOutRef, "xt_out");
-        log(`  x_out:  maxDiff=${xCmp.maxDiff.toExponential(3)}, MAE=${xCmp.mae.toExponential(3)}`);
-        log(`  xt_out: maxDiff=${xtCmp.maxDiff.toExponential(3)}, MAE=${xtCmp.mae.toExponential(3)}`);
-        xOut.dispose?.();
-        xtOut.dispose?.();
-        xTensor.dispose?.();
-        xtTensor.dispose?.();
-        // fp16 (WebNN-NPU/GPU via DirectML) typically has worst-case ~1e-2 to 5e-2 on
-        // large tensors; mean error is the more meaningful measure. Pass if MAE < 1e-3.
-        const pass = xCmp.mae < 1e-3 && xtCmp.mae < 1e-3;
-        log(pass ? `✓ fwd VALIDATION PASSED (MAE check; fp16 ok)` : `✗ fwd VALIDATION FAILED (MAE too large)`);
-        resultEl.innerHTML = `
-          <div style="padding: 10px; border-radius: 6px; background: ${pass ? "#d4edda" : "#f8d7da"}; color: ${pass ? "#155724" : "#721c24"}; font-weight: 600; margin-bottom: 12px;">
-            ${pass ? "✓ PASS" : "✗ FAIL"} — x_out maxDiff=${xCmp.maxDiff.toExponential(3)}, xt_out maxDiff=${xtCmp.maxDiff.toExponential(3)}
-          </div>
-          <table class="tensor-table">
-            <tr><th>Tensor</th><th>maxDiff</th><th>MAE</th></tr>
-            <tr><td>x_out [1,16,2048,336]</td><td>${xCmp.maxDiff.toExponential(3)}</td><td>${xCmp.mae.toExponential(3)}</td></tr>
-            <tr><td>xt_out [1,8,343980]</td><td>${xtCmp.maxDiff.toExponential(3)}</td><td>${xtCmp.mae.toExponential(3)}</td></tr>
-          </table>
-        `;
-        return;
-    }
-
-    resultEl.innerHTML =
-        '<span class="badge badge-error">Unsupported model type — only fwd-only models are supported.</span>';
-}
-
-async function runPostForwardValidation() {
-    const resultEl = document.getElementById("post-validate-result");
-    resultEl.innerHTML = "<em>Fetching reference files...</em>";
-    log("");
-    log("=== post_forward VALIDATION ===");
-    const xOutRef = await fetchFloat32("./reference/fwd_xout.f32");
-    const xtOutRef = await fetchFloat32("./reference/fwd_xtout.f32");
-    const stemsRef = await fetchFloat32("./reference/stems_ref.f32");
-    const normStats = await fetchFloat32("./reference/norm_stats.f32");
-    const std = normStats[0],
-        mean = normStats[1],
-        meant = normStats[2],
-        stdt = normStats[3];
-    log(
-        `  norm stats: std=${std.toExponential(3)}, mean=${mean.toExponential(3)}, meant=${meant.toExponential(3)}, stdt=${stdt.toExponential(3)}`,
-    );
-    log(`  xOut length=${xOutRef.length} (expect ${1 * 16 * 2048 * 336})`);
-    log(`  xtOut length=${xtOutRef.length} (expect ${1 * 8 * 343980})`);
-    log(`  stems length=${stemsRef.length} (expect ${1 * 4 * 2 * 343980})`);
-
-    const tPost = performance.now();
-    const stems = htdemucsPostForward(xOutRef, xtOutRef, mean, std, meant, stdt);
-    const postMs = performance.now() - tPost;
-    log(`  post_forward completed in ${postMs.toFixed(0)}ms`);
-
-    const overall = compareFloat32(stems, stemsRef, "overall");
-    log(
-        `  overall: maxDiff=${overall.maxDiff.toExponential(3)} @ idx ${overall.maxDiffIdx}, MAE=${overall.mae.toExponential(3)}`,
-    );
-    log(`    JS[maxDiff]=${overall.jsAtMax.toExponential(3)}, REF[maxDiff]=${overall.refAtMax.toExponential(3)}`);
-
-    const stemNames = ["drums", "bass", "other", "vocals"];
-    const STEM_SIZE = 2 * SEGMENT_LENGTH;
-    const perStem = [];
-    for (let s = 0; s < 4; s++) {
-        const jsStem = stems.subarray(s * STEM_SIZE, (s + 1) * STEM_SIZE);
-        const refStem = stemsRef.subarray(s * STEM_SIZE, (s + 1) * STEM_SIZE);
-        const cmp = compareFloat32(jsStem, refStem, stemNames[s]);
-        const jsStats = computeStats(jsStem);
-        const refStats = computeStats(refStem);
-        perStem.push({ name: stemNames[s], cmp, jsStats, refStats });
-        log(`  ${stemNames[s]}: maxDiff=${cmp.maxDiff.toExponential(3)}, MAE=${cmp.mae.toExponential(3)}`);
-        log(`    JS  peak=${jsStats.peak.toFixed(4)}, rms=${jsStats.rms.toFixed(4)}`);
-        log(`    REF peak=${refStats.peak.toFixed(4)}, rms=${refStats.rms.toFixed(4)}`);
-    }
-
-    // Post_forward runs pure JS fp32, so expect tight agreement with Python fp32 ref.
-    const pass = overall.maxDiff < 1e-3;
-    log(pass ? `✓ post_forward VALIDATION PASSED` : `✗ post_forward VALIDATION FAILED`);
-
-    let html = `
-        <div style="padding: 10px; border-radius: 6px; background: ${pass ? "#d4edda" : "#f8d7da"}; color: ${pass ? "#155724" : "#721c24"}; font-weight: 600; margin-bottom: 12px;">
-          ${pass ? "✓ PASS" : "✗ FAIL"} — overall maxDiff=${overall.maxDiff.toExponential(3)}, MAE=${overall.mae.toExponential(3)}
-        </div>
-        <table class="tensor-table">
-          <tr><th>Stem</th><th>maxDiff</th><th>MAE</th><th>JS peak</th><th>REF peak</th><th>JS rms</th><th>REF rms</th></tr>
-      `;
-    for (const entry of perStem) {
-        html += `<tr>
-          <td>${entry.name}</td>
-          <td>${entry.cmp.maxDiff.toExponential(3)}</td>
-          <td>${entry.cmp.mae.toExponential(3)}</td>
-          <td>${entry.jsStats.peak.toFixed(4)}</td>
-          <td>${entry.refStats.peak.toFixed(4)}</td>
-          <td>${entry.jsStats.rms.toFixed(4)}</td>
-          <td>${entry.refStats.rms.toFixed(4)}</td>
-        </tr>`;
-    }
-    html += "</table>";
-    resultEl.innerHTML = html;
-}
-
-// ============================================================================
-// Main
-// ============================================================================
-
-async function main() {
-    loadBtn.disabled = true;
-    statusEl.textContent = "Loading...";
-
-    try {
-        await loadOrt();
-
-        log("");
-        log("Probing backend capabilities...");
-        const caps = await detectCapabilities();
-        const capBadges = [];
-        if (caps.webnn_npu) capBadges.push('<span class="badge badge-success">WebNN-NPU</span>');
-        if (caps.webnn_gpu) capBadges.push('<span class="badge badge-success">WebNN-GPU</span>');
-        if (caps.webgpu) capBadges.push('<span class="badge badge-info">WebGPU</span>');
-        capBadges.push('<span class="badge badge-warning">WASM</span>');
-        log(
-            `Available: ${[
-                caps.webnn_npu ? "WebNN-NPU" : null,
-                caps.webnn_gpu ? "WebNN-GPU" : null,
-                caps.webgpu ? "WebGPU" : null,
-                "WASM",
-            ]
-                .filter(Boolean)
-                .join(", ")}`,
-        );
-
-        log("");
-        const modelKey = document.getElementById("model-select").value;
-        const modelConfig = MODELS[modelKey];
-        log(`Using model: ${modelConfig.label}`);
-        const modelBuffer = await loadModelBuffer(modelConfig);
-        hideProgress();
-
-        log("");
-        log("Creating ORT session (trying backends in cascade)...");
-        const selection = document.getElementById("backend-select").value;
-        updateBackendBadge(selection);
-        const { session, backendLabel } = await createSessionWithCascade(modelBuffer, caps, selection, modelConfig);
-        window.__htdemucsSession = session;
-        window.__htdemucsBackend = backendLabel;
-        window.__htdemucsModelConfig = modelConfig;
-        updateBackendBadge(backendLabel);
-
-        statusEl.innerHTML = `${capBadges.join(" ")} — Session loaded with <strong>${backendLabel}</strong>`;
-
-        log("");
-        log("✓ Model loaded and ready for audio.");
-        document.getElementById("audio-file").disabled = false;
-        document.getElementById("audio-gate-msg").textContent = "Choose an audio file.";
-    } catch (err) {
-        log("✗ Error: " + err.message);
-        console.error(err);
-        statusEl.innerHTML = `<span class="badge badge-error">Failed: ${err.message}</span>`;
-    } finally {
-        loadBtn.disabled = false;
-    }
-}
-
+// Same query scheme as the other demos: ?provider=webnn|webgpu|wasm&devicetype=npu|gpu.
 function applyBackendFromQuery() {
-    const raw = new URLSearchParams(window.location.search).get("devicetype");
-    if (!raw) return;
-    const key = raw.toLowerCase();
-    const mapping = {
-        npu: "webnn-npu",
-        gpu: "webnn-gpu",
-        "webnn-npu": "webnn-npu",
-        "webnn-gpu": "webnn-gpu",
-        webgpu: "webgpu",
-        wasm: "wasm",
-        auto: "auto",
-    };
-    const target = mapping[key];
-    if (!target) return;
-    const select = document.getElementById("backend-select");
-    const optionExists = Array.from(select.options).some(option => option.value === target);
-    if (!optionExists) return;
-    select.value = target;
-    updateBackendBadge(select.value);
-    log(`Backend preselected from query: ${target}`);
+    const provider = getQueryValue("provider")?.toLowerCase();
+    const deviceType = getQueryValue("devicetype")?.toLowerCase();
+    if (!provider && !deviceType) return;
+    const target = provider === "webgpu" || provider === "wasm" ? provider : `webnn-${deviceType || "gpu"}`;
+    if (!BACKENDS.some(backend => backend.id === target)) return;
+    backendSelect.value = target;
+    updateBackendBadge(target);
 }
 
-applyBackendFromQuery();
-showCompatibleChromiumVersion("stem-separator");
-updateWebnnStatus();
-loadOrt();
+const ui = async () => {
+    applyBackendFromQuery();
+    await setupORT("stem-separator", "dev");
+    showCompatibleChromiumVersion("stem-separator");
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.simd = true;
+    // WASM and WebGPU still work without WebNN, so loading is not gated on the check below.
+    loadButton.disabled = false;
+    await checkWebNN();
+};
 
-loadBtn.addEventListener("click", main);
-document.getElementById("backend-select").addEventListener("change", event => {
-    updateBackendBadge(event.target.value);
+if (document.readyState !== "loading") {
+    ui();
+} else {
+    document.addEventListener("DOMContentLoaded", ui, false);
+}
+
+loadButton.addEventListener("click", loadModel);
+backendSelect.addEventListener("change", updateSessionState);
+
+mixPlayButton.addEventListener("click", () => {
+    if (inputAudio.paused) inputAudio.play().catch(() => {});
+    else inputAudio.pause();
 });
+// The mix preview and the stem mixer share the speakers, so only one plays at a time.
+inputAudio.addEventListener("play", () => {
+    mixPlayButton.classList.add("playing");
+    mixerPause();
+});
+inputAudio.addEventListener("pause", () => mixPlayButton.classList.remove("playing"));
 
-document.getElementById("infer-btn").addEventListener("click", async () => {
-    const btn = document.getElementById("infer-btn");
-    btn.disabled = true;
+inferButton.addEventListener("click", async () => {
+    inferButton.disabled = true;
     setInferenceControlsDisabled(true);
     try {
         await runInference();
-    } catch (err) {
-        log("✗ Inference error: " + err.message);
-        console.error(err);
-        document.getElementById("infer-result").innerHTML =
-            `<span class="badge badge-error">Failed: ${err.message}</span>`;
+    } catch (error) {
+        logError(`[Session Run] failed, ${error.message}`);
+        showErrorBadge($("#infer-result"), error.message);
+        // Keep `streaming` set so seeking stays clamped to the audio that did finalize.
+        mixerPause();
+        stemMixer.resumeOnPublish = false;
+        for (const tile of Object.values(stemMixer.tiles)) tile.downloadButton.title = "Separation incomplete";
+        updateTransportUi();
     } finally {
         setInferenceControlsDisabled(false);
-        btn.disabled = false;
+        updateSessionState();
     }
 });
 
-document.getElementById("audio-file").addEventListener("change", async event => {
+audioFileInput.addEventListener("change", async event => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const input = event.target;
-    input.disabled = true;
+    audioFileInput.disabled = true;
     try {
         await handleAudioFile(file);
-    } catch (err) {
-        log("✗ Audio ingest error: " + err.message);
-        console.error(err);
-        document.getElementById("audio-info").innerHTML =
-            `<span class="badge badge-error">Failed: ${err.message}</span>`;
+    } catch (error) {
+        logError(`[Audio] failed, ${error.message}`);
+        showStageMessage(`Failed to load audio: ${error.message}`);
     } finally {
-        input.disabled = false;
+        audioFileInput.disabled = false;
     }
 });

@@ -242,11 +242,6 @@ const KNOWN_COMPATIBLE_ORT_VERSION = {
         stable: STABLE_ORT_VERSION,
         test: TEST_ORT_VERSION,
     },
-    "noise-suppression": {
-        dev: DEV_ORT_VERSION,
-        stable: STABLE_ORT_VERSION,
-        test: TEST_ORT_VERSION,
-    },
 };
 
 const ORT_BASE_URL = "https://www.npmjs.com/package/onnxruntime-web/v/";
