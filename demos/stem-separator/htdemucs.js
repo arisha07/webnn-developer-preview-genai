@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 //
 // HTDemucs signal processing around the ONNX forward pass: segmenting, STFT / iSTFT,
-// pre_forward / post_forward and overlap-add. Mirrors demucs4ht.py with num_subbands=1,
-// cac=True and use_train_segment=True.
+// pre_forward / post_forward and overlap-add, following the standard HTDemucs configuration
+// (num_subbands=1, cac=True and use_train_segment=True).
 //
 
 export const SAMPLE_RATE = 44100;
@@ -285,7 +285,7 @@ function normalizeInPlace(values) {
 }
 
 // Builds the normalized model inputs `x` (spectrogram) and `xt` (waveform) for one planar stereo
-// segment, plus the statistics post_forward needs (demucs4ht.py:548-585).
+// segment, plus the statistics post_forward needs.
 export function htdemucsPreForward(segment) {
     const spectrogram = new Float32Array(4 * FREQUENCY_BINS * TIME_FRAMES);
     computeSpectrogram(segment, spectrogram);
