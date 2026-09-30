@@ -95,6 +95,7 @@ const loadButton = $("#load-btn");
 const inferButton = $("#infer-btn");
 const audioFileInput = $("#audio-file");
 const inputAudio = $("#input-audio");
+let inputWaveformState = null; // destroy()ed and replaced whenever a new file is loaded
 const mixPlayButton = $("#mix-play-btn");
 const mixTrack = $("#mix-track");
 const stemGrid = $("#stem-grid");
@@ -368,9 +369,12 @@ function formatSampleCount(sampleCount) {
 // Stems from the previous run or file are stale the moment a new one starts: stop the mixer
 // and clear them, so nothing keeps playing underneath and no mismatched results stay visible.
 function clearStemResults() {
+    for (const tile of Object.values(stemMixer.tiles)) tile.destroy?.();
     resetStemMixer();
     stemGrid.innerHTML = "";
     $("#stem-stats").innerHTML = "";
+    downloadAllButton.disabled = true;
+    downloadAllButton.onclick = null;
     resultsGateMessage.hidden = mixTrack.hidden;
 }
 
@@ -404,14 +408,16 @@ async function handleAudioFile(file) {
 
     inputAudio.pause();
     inputAudio.src = URL.createObjectURL(file);
-    // A fresh canvas drops the previous file's waveform listeners.
+    // A fresh canvas drops the previous file's click/pointer listeners; destroy() drops the ones
+    // attached to the shared `inputAudio` clock, which would otherwise leak across file loads.
+    inputWaveformState?.destroy();
     const previousWaveform = $("#input-waveform");
     const inputWaveform = previousWaveform.cloneNode(false);
     previousWaveform.replaceWith(inputWaveform);
     $("#stage-empty").hidden = true;
     mixTrack.hidden = false;
     resultsGateMessage.hidden = false;
-    setupWaveform(inputWaveform, left, right, inputAudio, MIX_COLOR);
+    inputWaveformState = setupWaveform(inputWaveform, left, right, inputAudio, MIX_COLOR);
     audioInfo.innerHTML = `
         <details class="audio-details">
           <summary>Audio details</summary>
@@ -554,8 +560,6 @@ function showStemStatistics(stems, left, right) {
 function renderStemShells(stems, totalSamples, fileName) {
     startStemMixer(totalSamples);
     const baseName = stripExtension(fileName);
-    downloadAllButton.disabled = true;
-    downloadAllButton.onclick = null;
 
     for (const name of STEM_NAMES) {
         const tile = document.createElement("div");
@@ -599,6 +603,7 @@ function renderStemShells(stems, totalSamples, fileName) {
             sizeElement: tile.querySelector(".stem-size"),
             downloadButton,
             redraw: () => waveformState.draw(),
+            destroy: () => waveformState.destroy(),
         };
     }
     resultsGateMessage.hidden = true;

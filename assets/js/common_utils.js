@@ -11,7 +11,6 @@ const KNOWN_COMPATIBLE_CHROMIUM_VERSION = {
     "image-classification": "136.0.7051.0",
     "text-generation": "136.0.7051.0",
     "stem-separator": "136.0.7051.0",
-    "noise-suppression": "136.0.7051.0",
 };
 
 export const showCompatibleChromiumVersion = key => {

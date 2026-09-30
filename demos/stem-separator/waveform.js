@@ -113,36 +113,85 @@ function drawWaveform(canvas, left, right, clock, state) {
 // `clock` is anything exposing the HTMLAudioElement subset used here (duration, paused, currentTime,
 // play/pause/ended events): both <audio> and the stem transport qualify. `readySamples` optionally
 // reports how much of left/right is final; omit it for complete buffers.
+//
+// `clock` may be a long-lived, shared object (e.g. the stem transport used by every stem tile), so
+// callers must call the returned state's `destroy()` before discarding a waveform — otherwise the
+// listeners attached here keep `left`/`right` (and the canvas) alive for the lifetime of the page.
 export function setupWaveform(canvas, left, right, clock, color, readySamples = null) {
     canvas.dataset.color = color;
     const state = { draw: null, animationFrame: null, layer: null, layerKey: "", renderedX: 0, readySamples };
     state.draw = () => drawWaveform(canvas, left, right, clock, state);
-    new ResizeObserver(() => state.draw()).observe(canvas);
 
-    canvas.addEventListener("click", event => {
+    canvas.tabIndex = 0;
+    canvas.setAttribute("role", "slider");
+    canvas.setAttribute("aria-valuemin", "0");
+    const updateAriaValue = () => {
+        const duration = clock.duration || 0;
+        canvas.setAttribute("aria-valuemax", duration.toFixed(1));
+        canvas.setAttribute("aria-valuenow", (clock.currentTime || 0).toFixed(1));
+        canvas.setAttribute("aria-valuetext", `${(clock.currentTime || 0).toFixed(1)}s of ${duration.toFixed(1)}s`);
+    };
+    updateAriaValue();
+
+    const resizeObserver = new ResizeObserver(() => state.draw());
+    resizeObserver.observe(canvas);
+
+    const handleClick = event => {
         if (!clock.duration) return;
         const bounds = canvas.getBoundingClientRect();
         clock.currentTime = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)) * clock.duration;
+        updateAriaValue();
         state.draw();
-    });
-    canvas.addEventListener("pointermove", event => {
+    };
+    const handlePointerMove = event => {
         const position = (event.clientX - canvas.getBoundingClientRect().left) / canvas.clientWidth;
         canvas.title = clock.duration ? `${(position * clock.duration).toFixed(1)}s` : "Waveform";
-    });
-    clock.addEventListener("play", () => {
+    };
+    const handleKeyDown = event => {
+        if (!clock.duration) return;
+        const step = event.shiftKey ? 10 : 1;
+        if (event.key === "ArrowRight") clock.currentTime = Math.min(clock.duration, clock.currentTime + step);
+        else if (event.key === "ArrowLeft") clock.currentTime = Math.max(0, clock.currentTime - step);
+        else if (event.key === "Home") clock.currentTime = 0;
+        else if (event.key === "End") clock.currentTime = clock.duration;
+        else return;
+        event.preventDefault();
+        updateAriaValue();
+        state.draw();
+    };
+    const handlePlay = () => {
         const animate = () => {
+            updateAriaValue();
             state.draw();
             if (!clock.paused) state.animationFrame = requestAnimationFrame(animate);
         };
         cancelAnimationFrame(state.animationFrame);
         animate();
-    });
-    const stopAnimation = () => {
+    };
+    const handleStop = () => {
         cancelAnimationFrame(state.animationFrame);
+        updateAriaValue();
         state.draw();
     };
-    clock.addEventListener("pause", stopAnimation);
-    clock.addEventListener("ended", stopAnimation);
+
+    canvas.addEventListener("click", handleClick);
+    canvas.addEventListener("pointermove", handlePointerMove);
+    canvas.addEventListener("keydown", handleKeyDown);
+    clock.addEventListener("play", handlePlay);
+    clock.addEventListener("pause", handleStop);
+    clock.addEventListener("ended", handleStop);
+
+    state.destroy = () => {
+        cancelAnimationFrame(state.animationFrame);
+        resizeObserver.disconnect();
+        canvas.removeEventListener("click", handleClick);
+        canvas.removeEventListener("pointermove", handlePointerMove);
+        canvas.removeEventListener("keydown", handleKeyDown);
+        clock.removeEventListener("play", handlePlay);
+        clock.removeEventListener("pause", handleStop);
+        clock.removeEventListener("ended", handleStop);
+    };
+
     state.draw();
     return state;
 }

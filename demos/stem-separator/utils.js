@@ -95,9 +95,11 @@ export function triggerDownload(blob, fileName) {
 export async function decodeAudioFile(file) {
     const arrayBuffer = await file.arrayBuffer();
     const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    audioContext.close();
-    return audioBuffer;
+    try {
+        return await audioContext.decodeAudioData(arrayBuffer);
+    } finally {
+        await audioContext.close();
+    }
 }
 
 export async function resampleAudioBuffer(audioBuffer, sampleRate) {
