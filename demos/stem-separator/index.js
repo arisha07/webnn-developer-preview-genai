@@ -379,6 +379,9 @@ function clearStemResults() {
 }
 
 async function handleAudioFile(file) {
+    inputAudio.pause();
+    audioInput = null;
+    updateSessionState();
     const audioInfo = $("#audio-info");
     audioInfo.innerHTML = "";
     mixTrack.hidden = true;

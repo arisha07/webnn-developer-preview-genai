@@ -64,6 +64,11 @@ export const stemTransport = {
     addEventListener(type, callback) {
         stemMixer.listeners[type]?.push(callback);
     },
+    removeEventListener(type, callback) {
+        const listeners = stemMixer.listeners[type];
+        const index = listeners?.indexOf(callback) ?? -1;
+        if (index >= 0) listeners.splice(index, 1);
+    },
 };
 
 function mixerEmit(type) {

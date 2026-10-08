@@ -180,6 +180,7 @@ export function setupWaveform(canvas, left, right, clock, color, readySamples = 
     clock.addEventListener("play", handlePlay);
     clock.addEventListener("pause", handleStop);
     clock.addEventListener("ended", handleStop);
+    clock.addEventListener("durationchange", updateAriaValue);
 
     state.destroy = () => {
         cancelAnimationFrame(state.animationFrame);
@@ -190,6 +191,7 @@ export function setupWaveform(canvas, left, right, clock, color, readySamples = 
         clock.removeEventListener("play", handlePlay);
         clock.removeEventListener("pause", handleStop);
         clock.removeEventListener("ended", handleStop);
+        clock.removeEventListener("durationchange", updateAriaValue);
     };
 
     state.draw();
